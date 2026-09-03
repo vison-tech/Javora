@@ -5,6 +5,7 @@ edition = "2021"
 description = "Rust core engine for the Javora Java engineering agent"
 license = "MIT"
 
+
 [[bin]]
 name = "javora-core"
 path = "src/main.rs"
