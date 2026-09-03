@@ -1,0 +1,16 @@
+[project]
+name = "javora"
+version = "0.1.0"
+description = "An interactive Java engineering agent for the terminal."
+requires-python = ">=3.11"
+dependencies = ["openai>=1.40.0"]
+
+[project.scripts]
+javora = "javora.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["javora*"]

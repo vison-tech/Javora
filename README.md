@@ -1,27 +1,92 @@
 # Javora
 
-Javora is an open-source, interactive AI coding agent for Java projects. It is designed as a terminal-first engineering partner that understands project structure, explains implementation plans, and helps developers analyze, change, build, and test code.
+## 中文
 
-## Status
+Javora 是一个面向 Java 开发者的开源 AI 编程 Agent，提供类似 Codex CLI 的交互式终端体验。
 
-Early development (`0.1.0`). The current scaffold provides an interactive REPL, project context, model configuration, and Maven/Gradle detection. File editing, command approvals, and the full tool loop are next.
+它能够理解当前项目结构，协助开发者分析代码、设计方案、定位问题，并逐步扩展到代码修改、构建和测试，目标是成为可靠的 Java 技术协作伙伴。
 
-## Quick start
+### 当前能力
+
+- 交互式终端对话
+- 自动读取当前项目文件结构
+- OpenAI-compatible 模型接口
+- 支持 OpenAI、Ollama 及其他兼容服务
+- Maven/Gradle 项目和测试命令识别
+- 面向 Java 工程实践的专家提示词
+
+### 快速开始
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-export OPENAI_API_KEY="your-key"
+export OPENAI_API_KEY="your-api-key"
 javora
 ```
 
-For Ollama or another OpenAI-compatible endpoint:
+使用 Ollama 或其他 OpenAI-compatible 服务：
 
 ```bash
 export JAVORA_BASE_URL="http://localhost:11434/v1"
 export JAVORA_MODEL="llama3.1"
 ```
+
+启动后可以直接输入：
+
+```text
+分析这个项目的订单创建流程
+找出 UserService 中潜在的并发问题
+/test
+/help
+/exit
+```
+
+项目目前处于早期开发阶段，文件修改、命令审批和完整工具调用循环正在持续完善。
+
+## English
+
+Javora is an open-source AI coding agent for Java developers, providing an interactive terminal experience inspired by Codex CLI.
+
+It understands the current project structure and helps developers analyze code, design implementation plans, investigate issues, and gradually extend into code editing, building, and testing. The goal is to become a reliable engineering partner for Java development.
+
+### Current capabilities
+
+- Interactive terminal REPL
+- Automatic project file context
+- OpenAI-compatible model API
+- Support for OpenAI, Ollama, and compatible providers
+- Maven and Gradle project/test command detection
+- Expert prompt focused on Java engineering practices
+
+### Quick start
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+export OPENAI_API_KEY="your-api-key"
+javora
+```
+
+For Ollama or another OpenAI-compatible provider:
+
+```bash
+export JAVORA_BASE_URL="http://localhost:11434/v1"
+export JAVORA_MODEL="llama3.1"
+```
+
+Example commands:
+
+```text
+Analyze the order creation flow in this project
+Find potential concurrency issues in UserService
+/test
+/help
+/exit
+```
+
+Javora is currently in early development. File editing, command approvals, and the complete tool execution loop are planned next.
 
 ## Vision
 
