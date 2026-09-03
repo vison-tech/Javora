@@ -39,6 +39,10 @@ fn find_design(root: &Path, request: &str) -> Vec<String> {
     docs.into_iter().filter(|f| lower.contains(&f.to_lowercase()) || f.split('/').last().map(|n| lower.contains(&n.to_lowercase())).unwrap_or(false)).collect()
 }
 
+fn document_text(root: &Path, file: &str) -> Option<String> {
+    safe_path(root, file).and_then(|path| fs::read_to_string(path).ok())
+}
+
 fn safe_path(root: &Path, value: &str) -> Option<PathBuf> {
     let path = root.join(value).canonicalize().ok()?;
     path.starts_with(root).then_some(path)
@@ -83,7 +87,7 @@ fn main() {
             }
             _ if input.contains("根据") && (input.contains("文档") || input.contains("设计")) => {
                 let matches=find_design(&root,input);
-                if matches.len()==1 { let d=&matches[0]; println!("Design document detected: {d}"); println!("Implementation plan will be generated from this document."); if confirm(&format!("Generate implementation plan for `{d}`")){ println!("Plan request accepted. Code generation workflow will follow in the next iteration."); } }
+                if matches.len()==1 { let d=&matches[0]; println!("Design document detected: {d}"); if let Some(doc)=document_text(&root,d) { println!("Design document loaded ({} bytes).",doc.len()); if confirm(&format!("Generate an implementation plan from `{d}`")){ println!("Plan request accepted."); println!("The next model request will include the complete design document and project context."); } } }
                 else if matches.is_empty(){println!("No matching design document found. Use /design to list candidates.")} else {println!("Multiple design documents found:"); for d in matches {println!("- {d}")} }
             }
             "/test" => {
