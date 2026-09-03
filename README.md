@@ -2,7 +2,7 @@
 
 ## 中文
 
-Javora 是一个面向 Java 开发者的开源 AI 编程 Agent，提供类似 Codex CLI 的交互式终端体验。
+Javora 是一个面向 Java 开发者的开源 AI 编程 Agent，采用 Rust 核心引擎和 TypeScript/Node.js CLI，提供类似 Codex CLI 的交互式终端体验。
 
 它能够理解当前项目结构，协助开发者分析代码、设计方案、定位问题，并逐步扩展到代码修改、构建和测试，目标是成为可靠的 Java 技术协作伙伴。
 
@@ -18,14 +18,13 @@ Javora 是一个面向 Java 开发者的开源 AI 编程 Agent，提供类似 Co
 ### 快速开始
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-export OPENAI_API_KEY="your-api-key"
+npm install
+npm run build:core
+npm link
 javora
 ```
 
-使用 Ollama 或其他 OpenAI-compatible 服务：
+使用 Ollama 或其他 OpenAI-compatible 服务（模型接入功能正在开发中）：
 
 ```bash
 export JAVORA_BASE_URL="http://localhost:11434/v1"
@@ -46,7 +45,7 @@ export JAVORA_MODEL="llama3.1"
 
 ## English
 
-Javora is an open-source AI coding agent for Java developers, providing an interactive terminal experience inspired by Codex CLI.
+Javora is an open-source AI coding agent for Java developers. It uses a Rust core engine and a TypeScript/Node.js CLI to provide an interactive terminal experience inspired by Codex CLI.
 
 It understands the current project structure and helps developers analyze code, design implementation plans, investigate issues, and gradually extend into code editing, building, and testing. The goal is to become a reliable engineering partner for Java development.
 
@@ -62,10 +61,9 @@ It understands the current project structure and helps developers analyze code, 
 ### Quick start
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-export OPENAI_API_KEY="your-api-key"
+npm install
+npm run build:core
+npm link
 javora
 ```
 
@@ -86,7 +84,7 @@ Find potential concurrency issues in UserService
 /exit
 ```
 
-Javora is currently in early development. File editing, command approvals, and the complete tool execution loop are planned next.
+Javora is currently in early development. Model integration, file editing, command approvals, and the complete tool execution loop are planned next.
 
 ## Vision
 

@@ -1,0 +1,10 @@
+[package]
+name = "javora-core"
+version = "0.2.0"
+edition = "2021"
+description = "Rust core engine for the Javora Java engineering agent"
+license = "MIT"
+
+[[bin]]
+name = "javora-core"
+path = "src/main.rs"

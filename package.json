@@ -1,0 +1,11 @@
+{
+  "name": "javora",
+  "version": "0.2.0",
+  "description": "An interactive AI engineering agent for Java projects",
+  "type": "module",
+  "bin": { "javora": "bin/javora.js" },
+  "files": ["bin", "native", "README.md", "LICENSE"],
+  "engines": { "node": ">=18" },
+  "scripts": { "build:core": "cargo build --release", "check": "node --check bin/javora.js" },
+  "license": "MIT"
+}
