@@ -1,6 +1,6 @@
 {
   "name": "javora",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "An interactive AI engineering agent for Java projects",
   "type": "module",
   "bin": { "javora": "bin/javora.js" },

@@ -31,12 +31,16 @@ fn project_context(root: &Path) -> String {
 
 fn design_documents(root: &Path) -> Vec<String> {
     let mut all = Vec::new(); let _ = collect_files(root, &mut all);
-    all.into_iter().filter(|f| { let lower=f.to_lowercase(); [".md", ".txt", ".yaml", ".yml", ".json", ".xml"].iter().any(|x| lower.ends_with(x)) && ["design", "spec", "架构", "需求", "方案", "说明"].iter().any(|x| lower.contains(x)) }).collect()
+    all.into_iter().filter(|f| {
+        let lower=f.to_lowercase();
+        let supported=[".md", ".txt", ".yaml", ".yml", ".json", ".xml"].iter().any(|x| lower.ends_with(x));
+        supported && (lower.starts_with("docs/") || ["design", "spec", "architecture", "requirements", "架构", "需求", "方案", "说明"].iter().any(|x| lower.contains(x)))
+    }).collect()
 }
 
 fn find_design(root: &Path, request: &str) -> Vec<String> {
     let docs=design_documents(root); let lower=request.to_lowercase();
-    docs.into_iter().filter(|f| lower.contains(&f.to_lowercase()) || f.split('/').last().map(|n| lower.contains(&n.to_lowercase())).unwrap_or(false)).collect()
+    docs.into_iter().filter(|f| lower.contains(&f.to_lowercase()) || f.split('/').next_back().map(|n| lower.contains(&n.to_lowercase())).unwrap_or(false)).collect()
 }
 
 fn document_text(root: &Path, file: &str) -> Option<String> {
@@ -44,8 +48,25 @@ fn document_text(root: &Path, file: &str) -> Option<String> {
 }
 
 fn safe_path(root: &Path, value: &str) -> Option<PathBuf> {
+    let root = root.canonicalize().ok()?;
     let path = root.join(value).canonicalize().ok()?;
-    path.starts_with(root).then_some(path)
+    if path.strip_prefix(&root).is_ok() { Some(path) } else { None }
+}
+
+fn model_request(root: &Path, input: &str, document: Option<&str>) {
+    let key = env::var("OPENAI_API_KEY").unwrap_or_default();
+    if key.is_empty() { println!("OPENAI_API_KEY is not set."); return; }
+    let base = env::var("JAVORA_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+    let model = env::var("JAVORA_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+    let document = document.map(|d| format!("\n\nDesign document:\n{d}")).unwrap_or_default();
+    let prompt = format!("{}{}\n\nUser task: {input}", project_context(root), document);
+    let prompt = prompt.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t");
+    let body = format!(r###"{{"model":"{}","messages":[{{"role":"system","content":"You are Javora, a senior Java engineer. Return a concise implementation plan before code changes."}},{{"role":"user","content":"{}"}}]}}"###, model, prompt);
+    match Command::new("curl").args(["-fsS", "-X", "POST", &format!("{}/chat/completions", base.trim_end_matches('/')), "-H", &format!("Authorization: Bearer {key}"), "-H", "Content-Type: application/json", "-d", &body]).output() {
+        Ok(output) if output.status.success() => println!("{}", String::from_utf8_lossy(&output.stdout)),
+        Ok(output) => println!("Model request failed: {}", String::from_utf8_lossy(&output.stderr)),
+        Err(error) => println!("Unable to start curl: {error}"),
+    }
 }
 
 fn confirm(command: &str) -> bool {
@@ -67,7 +88,7 @@ fn main() {
         let input = input.trim();
         match input {
             "/exit" | "/quit" => break,
-            "/help" => println!("/help\n/files\n/design\n/read <path>\n/search <text>\n/run <command>\n/test\n/exit"),
+            "/help" => println!("/help\n/files\n/design\n/read <path>\n/search <text>\n/run <command>\n/test\n/implement <request>\n/exit"),
             "/files" => println!("{}", project_context(&root)),
             "/design" => { let docs=design_documents(&root); if docs.is_empty(){println!("No design documents detected.")} else { for d in docs {println!("{d}")} } }
             _ if input.starts_with("/read ") => {
@@ -85,9 +106,10 @@ fn main() {
                 let command = input.trim_start_matches("/run ");
                 if confirm(command) { println!("Result: {:?}", Command::new("sh").arg("-c").arg(command).current_dir(&root).status()); }
             }
-            _ if input.contains("根据") && (input.contains("文档") || input.contains("设计")) => {
-                let matches=find_design(&root,input);
-                if matches.len()==1 { let d=&matches[0]; println!("Design document detected: {d}"); if let Some(doc)=document_text(&root,d) { println!("Design document loaded ({} bytes).",doc.len()); if confirm(&format!("Generate an implementation plan from `{d}`")){ println!("Plan request accepted."); println!("The next model request will include the complete design document and project context."); } } }
+            _ if input.starts_with("/implement ") || (input.contains("根据") && (input.contains("文档") || input.contains("设计"))) => {
+                let request = input.strip_prefix("/implement ").unwrap_or(input);
+                let matches=find_design(&root,request);
+                if matches.len()==1 { let d=&matches[0]; println!("Design document detected: {d}"); if let Some(doc)=document_text(&root,d) { println!("Design document loaded ({} bytes).",doc.len()); if confirm(&format!("Generate an implementation plan from `{d}`")){ model_request(&root, request, Some(&doc)); } } }
                 else if matches.is_empty(){println!("No matching design document found. Use /design to list candidates.")} else {println!("Multiple design documents found:"); for d in matches {println!("- {d}")} }
             }
             "/test" => {
@@ -98,18 +120,7 @@ fn main() {
             }
             "" => {}
             _ => {
-                let key = env::var("OPENAI_API_KEY").unwrap_or_default();
-                if key.is_empty() { println!("OPENAI_API_KEY is not set."); continue; }
-                let base = env::var("JAVORA_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-                let model = env::var("JAVORA_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
-                let prompt = format!("{}\n\nUser task: {input}", project_context(&root));
-                let prompt = prompt.replace('"', "\\\"").replace('\n', "\\n");
-                let body = format!(r###"{{"model":"{}","messages":[{{"role":"user","content":"{}"}}]}}"###, model, prompt);
-                match Command::new("curl").args(["-fsS", "-X", "POST", &format!("{}/chat/completions", base.trim_end_matches('/')), "-H", &format!("Authorization: Bearer {key}"), "-H", "Content-Type: application/json", "-d", &body]).output() {
-                    Ok(output) if output.status.success() => println!("{}", String::from_utf8_lossy(&output.stdout)),
-                    Ok(output) => println!("Model request failed: {}", String::from_utf8_lossy(&output.stderr)),
-                    Err(error) => println!("Unable to start curl: {error}"),
-                }
+                model_request(&root, input, None);
             }
         }
     }
