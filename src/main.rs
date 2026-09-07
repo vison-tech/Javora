@@ -27,9 +27,17 @@ struct ChangePlan {
     tests: Vec<String>,
 }
 
+enum Workflow {
+    Idle,
+    Clarifying { transcript: String },
+    AwaitingApproval { requirement: String, plan: String },
+    Approved { requirement: String },
+}
+
 struct Session {
     history: Vec<String>,
     last_command_result: Option<String>,
+    workflow: Workflow,
 }
 
 impl Session {
@@ -37,6 +45,7 @@ impl Session {
         Self {
             history: Vec::new(),
             last_command_result: None,
+            workflow: Workflow::Idle,
         }
     }
 
@@ -52,6 +61,136 @@ impl Session {
         let result = self.last_command_result.as_deref().unwrap_or("");
         format!("\n\nRecent conversation:\n{history}\n\nLatest command result:\n{result}")
     }
+}
+
+fn confirmed(input: &str) -> bool {
+    matches!(
+        input.trim().to_lowercase().as_str(),
+        "y" | "yes" | "确认" | "同意" | "approve"
+    )
+}
+
+fn requirement_response(root: &Path, session: &Session, requirement: &str) -> Option<String> {
+    let system = "You are Javora's requirements analyst. Do not inspect files or propose code changes. Ask exactly one focused question when certainty is below 95 percent. Return exactly one of: JAVORA_CLARIFY\nCONFIDENCE: 0-94\nQUESTION: one question; or JAVORA_REQUIREMENT_PLAN\nCONFIDENCE: 95-100\nPLAN: concise plan with scope, acceptance criteria, risks, and verification\nEND_JAVORA_REQUIREMENT_PLAN.";
+    model_request(root, session, requirement, None, system, false)
+}
+
+fn parse_requirement(response: &str, transcript: &str) -> Result<Workflow, String> {
+    if let Some(body) = response.strip_prefix("JAVORA_CLARIFY\n") {
+        let confidence = body
+            .lines()
+            .find_map(|line| line.strip_prefix("CONFIDENCE: "))
+            .and_then(|value| value.parse::<u8>().ok())
+            .ok_or("Missing clarification confidence")?;
+        let question = body
+            .lines()
+            .find_map(|line| line.strip_prefix("QUESTION: "))
+            .ok_or("Missing clarification question")?;
+        if confidence >= 95 {
+            return Err("Clarification confidence must be below 95".into());
+        }
+        if question.trim().is_empty()
+            || question.matches('?').count() > 1
+            || question.matches('？').count() > 1
+        {
+            return Err("Clarification response must contain exactly one focused question".into());
+        }
+        return Ok(Workflow::Clarifying {
+            transcript: transcript.to_owned(),
+        });
+    }
+    let body = response
+        .strip_prefix("JAVORA_REQUIREMENT_PLAN\n")
+        .and_then(|text| text.strip_suffix("\nEND_JAVORA_REQUIREMENT_PLAN"))
+        .ok_or("Model did not return a requirements response")?;
+    let confidence = body
+        .lines()
+        .find_map(|line| line.strip_prefix("CONFIDENCE: "))
+        .and_then(|value| value.parse::<u8>().ok())
+        .ok_or("Missing plan confidence")?;
+    let plan = body
+        .lines()
+        .skip_while(|line| !line.starts_with("PLAN: "))
+        .map(|line| line.strip_prefix("PLAN: ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if confidence < 95 || plan.is_empty() {
+        return Err("Plan requires 95+ confidence and a plan".into());
+    }
+    Ok(Workflow::AwaitingApproval {
+        requirement: transcript.to_owned(),
+        plan,
+    })
+}
+
+fn question_from(response: &str) -> Option<&str> {
+    response
+        .lines()
+        .find_map(|line| line.strip_prefix("QUESTION: "))
+}
+
+fn begin_or_continue_requirements(root: &Path, session: &mut Session, input: &str) {
+    let transcript = match &session.workflow {
+        Workflow::Idle => format!("User request: {input}"),
+        Workflow::Clarifying { transcript } => format!("{transcript}\nUser answer: {input}"),
+        Workflow::AwaitingApproval { requirement, plan } => {
+            format!("{requirement}\nUser plan feedback: {input}\nPreviously proposed plan:\n{plan}")
+        }
+        Workflow::Approved { requirement } => requirement.clone(),
+    };
+    let Some(response) = requirement_response(root, session, &transcript) else {
+        return;
+    };
+    session.remember(format!(
+        "Requirement input: {input}\nRequirements analyst: {response}"
+    ));
+    match parse_requirement(&response, &transcript) {
+        Ok(next @ Workflow::Clarifying { .. }) => {
+            if let Some(question) = question_from(&response) {
+                println!("{question}");
+            }
+            session.workflow = next;
+        }
+        Ok(Workflow::AwaitingApproval { requirement, plan }) => {
+            println!("\n需求已澄清（置信度 ≥95%）。\n{plan}\n\n请回复“确认”批准方案，或直接说明需要调整的内容。");
+            session.workflow = Workflow::AwaitingApproval { requirement, plan };
+        }
+        Ok(Workflow::Idle | Workflow::Approved { .. }) | Err(_) => {
+            println!("无法可靠解析需求分析结果，请重新描述或输入 /new。");
+        }
+    }
+}
+
+fn execute_approved(root: &Path, session: &mut Session, request: &str) {
+    let matches = find_design(root, request);
+    let document = if matches.len() == 1 {
+        let file = &matches[0];
+        println!("Design document detected: {file}");
+        document_text(root, file)
+    } else {
+        if matches.len() > 1 {
+            println!(
+                "Multiple design documents found; implementation will use project context only."
+            );
+        }
+        None
+    };
+    let system = "You are Javora, a senior Java engineer. Work only within the approved requirement. Return exactly a JAVORA_PLAN containing SUMMARY, FILE blocks, and optional TEST lines, ending with END_JAVORA_PLAN. Do not expand scope.";
+    if let Some(response) = model_request(root, session, request, document.as_deref(), system, true)
+    {
+        match parse_plan(&response) {
+            Ok(plan) if show_plan(root, &plan) => match apply_plan(root, &plan) {
+                Ok(()) => {
+                    println!("Changes applied.");
+                    run_suggested_tests(root, session, &plan.tests);
+                }
+                Err(error) => println!("Apply failed: {error}"),
+            },
+            Ok(_) => println!("Changes discarded."),
+            Err(error) => println!("Invalid change plan: {error}"),
+        }
+    }
+    session.workflow = Workflow::Idle;
 }
 
 fn ignored(path: &Path) -> bool {
@@ -156,6 +295,8 @@ fn model_request(
     session: &Session,
     input: &str,
     document: Option<&str>,
+    system: &str,
+    include_context: bool,
 ) -> Option<String> {
     let key = env::var("OPENAI_API_KEY").unwrap_or_default();
     if key.is_empty() {
@@ -167,19 +308,29 @@ fn model_request(
     let document = document
         .map(|d| format!("\n\nDesign document:\n{d}"))
         .unwrap_or_default();
-    let prompt = format!(
-        "{}{}{}\n\nUser task: {input}",
-        project_context(root),
-        document,
-        session.context(),
-    );
+    let context = if include_context {
+        project_context(root)
+    } else {
+        String::new()
+    };
+    let history = if include_context {
+        session.context()
+    } else {
+        String::new()
+    };
+    let prompt = format!("{context}{document}{history}\n\nUser task: {input}");
     let prompt = prompt
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t");
-    let system = "You are Javora, a senior Java engineer. Return a concise implementation plan before code changes.";
+    let system = system
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
     let body = format!(
         r#"{{"model":"{}","messages":[{{"role":"system","content":"{}"}},{{"role":"user","content":"{}"}}]}}"#,
         model, system, prompt
@@ -278,12 +429,17 @@ fn parse_plan(response: &str) -> Result<ChangePlan, String> {
                 return Err(format!("Missing content block for {path}"));
             }
             let mut content = String::new();
+            let mut closed = false;
             for content_line in lines.by_ref() {
                 if content_line == "```" {
+                    closed = true;
                     break;
                 }
                 content.push_str(content_line);
                 content.push('\n');
+            }
+            if !closed {
+                return Err(format!("Missing closing content block for {path}"));
             }
             if content.len() > MAX_FILE_BYTES {
                 return Err(format!("Generated content for {path} is too large"));
@@ -308,8 +464,15 @@ fn parse_plan(response: &str) -> Result<ChangePlan, String> {
 fn write_path(root: &Path, value: &str) -> Option<PathBuf> {
     let root = root.canonicalize().ok()?;
     let path = root.join(value);
-    let parent = path.parent()?.canonicalize().ok()?;
-    parent.strip_prefix(&root).ok()?;
+    let parent = path.parent()?;
+    let existing_parent = parent.canonicalize().ok().or_else(|| {
+        let mut candidate = parent.to_path_buf();
+        while !candidate.exists() {
+            candidate = candidate.parent()?.to_path_buf();
+        }
+        candidate.canonicalize().ok()
+    })?;
+    existing_parent.strip_prefix(&root).ok()?;
     Some(path)
 }
 
@@ -464,29 +627,38 @@ fn main() {
         let input = input.trim();
         match input {
             "/exit" | "/quit" => break,
-            "/help" => println!("/help\n/files\n/design\n/read <path>\n/search <text>\n/run <command>\n/test\n/implement <request>\n/exit"),
+            "/help" => println!("/help\n/new\n/files\n/design\n/read <path>\n/search <text>\n/run <command>\n/test\n/implement <request>\n/exit\n\nNatural-language requests always go through clarification first."),
+            "/new" => { session.workflow = Workflow::Idle; println!("Current requirement discarded."); }
+            "/files" | "/design" | "/test" if !matches!(session.workflow, Workflow::Approved { .. }) => {
+                println!("请先完成需求澄清并明确批准方案后再执行此命令。输入 /new 可重新开始。");
+            }
             "/files" => println!("{}", project_context(&root)),
             "/design" => { let docs=design_documents(&root); if docs.is_empty(){println!("No design documents detected.")} else { for d in docs {println!("{d}")} } }
             _ if input.starts_with("/read ") => {
+                if !matches!(session.workflow, Workflow::Approved { .. }) { println!("请先完成需求澄清并明确批准方案后再读取项目文件。"); continue; }
                 let path = input.trim_start_matches("/read ").trim();
                 match safe_path(&root, path).and_then(|p| fs::read_to_string(p).ok()) {
                     Some(contents) => println!("{contents}"), None => println!("File not found or outside project")
                 }
             }
             _ if input.starts_with("/search ") => {
+                if !matches!(session.workflow, Workflow::Approved { .. }) { println!("请先完成需求澄清并明确批准方案后再搜索项目。"); continue; }
                 let query = input.trim_start_matches("/search "); let mut found = Vec::new();
                 let _ = collect_files(&root, &mut found);
                 for file in found { if fs::read_to_string(root.join(&file)).map(|s| s.contains(query)).unwrap_or(false) { println!("{file}"); } }
             }
             _ if input.starts_with("/run ") => {
+                if !matches!(session.workflow, Workflow::Approved { .. }) { println!("请先完成需求澄清并明确批准方案后再运行命令。"); continue; }
                 let command = input.trim_start_matches("/run ");
                 if let Some(result) = run_command(&root, command) { session.last_command_result = Some(result); }
             }
             _ if input.starts_with("/implement ") || (input.contains("根据") && (input.contains("文档") || input.contains("设计"))) => {
-                let request = input.strip_prefix("/implement ").unwrap_or(input);
-                let matches=find_design(&root,request);
-                if matches.len()==1 { let d=&matches[0]; println!("Design document detected: {d}"); if let Some(doc)=document_text(&root,d) { println!("Design document loaded ({} bytes).",doc.len()); if confirm(&format!("Generate an implementation plan from `{d}`")){ if let Some(response)=model_request(&root, &session, request, Some(&doc)) { match parse_plan(&response) { Ok(plan) if show_plan(&root,&plan) => match apply_plan(&root,&plan) { Ok(())=>{ println!("Changes applied."); run_suggested_tests(&root, &mut session, &plan.tests); }, Err(error)=>println!("Apply failed: {error}") }, Ok(_) => println!("Changes discarded."), Err(error)=>println!("Invalid change plan: {error}"), } } } } }
-                else if matches.is_empty(){println!("No matching design document found. Use /design to list candidates.")} else {println!("Multiple design documents found:"); for d in matches {println!("- {d}")} }
+                if let Workflow::Approved { requirement } = &session.workflow {
+                    let requirement = requirement.clone();
+                    execute_approved(&root, &mut session, &format!("{requirement}\nAdditional request: {input}"));
+                } else {
+                    begin_or_continue_requirements(&root, &mut session, input);
+                }
             }
             "/test" => {
                 match test_command(&root) {
@@ -496,8 +668,45 @@ fn main() {
             }
             "" => {}
             _ => {
-                if let Some(answer) = model_request(&root, &session, input, None) { println!("{answer}"); session.remember(format!("User: {input}\nAssistant: {answer}")); }
+                match &session.workflow {
+                    Workflow::AwaitingApproval { requirement, .. } if confirmed(input) => {
+                        let requirement = requirement.clone();
+                        session.workflow = Workflow::Approved { requirement: requirement.clone() };
+                        execute_approved(&root, &mut session, &requirement);
+                    }
+                    Workflow::Approved { requirement } => {
+                        let requirement = requirement.clone();
+                        execute_approved(&root, &mut session, &format!("{requirement}\nAdditional request: {input}"));
+                    }
+                    _ => begin_or_continue_requirements(&root, &mut session, input),
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_confidence_response_keeps_the_workflow_clarifying() {
+        let response =
+            "JAVORA_CLARIFY\nCONFIDENCE: 72\nQUESTION: Which database should this feature use?";
+        let workflow = parse_requirement(response, "User request: add a feature").unwrap();
+        assert!(matches!(workflow, Workflow::Clarifying { .. }));
+    }
+
+    #[test]
+    fn high_confidence_response_requires_plan_approval() {
+        let response = "JAVORA_REQUIREMENT_PLAN\nCONFIDENCE: 95\nPLAN: Goal: add a health endpoint. Scope: one controller. Acceptance: returns 200. Verification: Maven test. Risks: endpoint exposure.\nEND_JAVORA_REQUIREMENT_PLAN";
+        let workflow = parse_requirement(response, "User request: add a health endpoint").unwrap();
+        assert!(matches!(workflow, Workflow::AwaitingApproval { .. }));
+    }
+
+    #[test]
+    fn unclosed_change_content_block_is_rejected() {
+        let response = "JAVORA_PLAN\nSUMMARY: add endpoint\nFILE: src/Main.java\n```\nclass Main {}\nEND_JAVORA_PLAN";
+        assert!(parse_plan(response).is_err());
     }
 }
