@@ -289,7 +289,7 @@ fn execute_approved(root: &Path, session: &mut Session, request: &str) {
         }
         None
     };
-    let system = "You are Javora, a senior Java engineer. Work only within the approved requirement. Return exactly a JAVORA_PLAN containing SUMMARY, FILE blocks, and optional TEST lines, ending with END_JAVORA_PLAN. Do not expand scope.";
+    let system = "You are Javora, a senior Java engineer. Work only within the approved requirement and the supplied project profile. Preserve the existing build system, module boundaries, package conventions, dependency injection style, exception handling, and test style. For Spring code, use existing annotations and layering where present. Return exactly a JAVORA_PLAN containing SUMMARY, FILE blocks, and optional TEST lines, ending with END_JAVORA_PLAN. Do not expand scope.";
     if let Some(response) = model_request(root, session, request, document.as_deref(), system, true)
     {
         match parse_plan(&response) {
@@ -344,10 +344,110 @@ fn project_context(root: &Path) -> String {
     files.sort();
     files.truncate(200);
     format!(
-        "Project root: {}\nFiles:\n{}",
+        "Project root: {}\n{}\nFiles:\n{}",
         root.display(),
+        java_project_context(root, &files),
         files.join("\n")
     )
+}
+
+fn java_project_context(root: &Path, files: &[String]) -> String {
+    let maven = root.join("pom.xml").exists();
+    let gradle = root.join("build.gradle").exists() || root.join("build.gradle.kts").exists();
+    let java_files: Vec<_> = files
+        .iter()
+        .filter(|file| file.ends_with(".java"))
+        .collect();
+    let test_count = java_files
+        .iter()
+        .filter(|file| file.contains("/src/test/") || file.contains("\\src\\test\\"))
+        .count();
+    let main_count = java_files.len().saturating_sub(test_count);
+    let modules: Vec<_> = files
+        .iter()
+        .filter_map(|file| {
+            file.strip_suffix("/pom.xml")
+                .or_else(|| file.strip_suffix("/build.gradle"))
+                .or_else(|| file.strip_suffix("/build.gradle.kts"))
+        })
+        .filter(|module| !module.is_empty())
+        .take(20)
+        .collect();
+    let mut symbols = Vec::new();
+    for file in java_files.iter().take(80) {
+        if let Some(symbol) = java_symbol(root, file) {
+            symbols.push(symbol);
+        }
+        if symbols.len() >= 40 {
+            break;
+        }
+    }
+    let build = match (maven, gradle) {
+        (true, true) => "Maven and Gradle",
+        (true, false) => "Maven",
+        (false, true) => "Gradle",
+        (false, false) => "unknown",
+    };
+    let module_text = if modules.is_empty() {
+        "single module or no build module detected".to_owned()
+    } else {
+        modules.join(", ")
+    };
+    let symbol_text = if symbols.is_empty() {
+        "none indexed".to_owned()
+    } else {
+        symbols.join("\n")
+    };
+    format!("Java project profile:\nBuild: {build}\nModules: {module_text}\nJava sources: {main_count}, tests: {test_count}\nIndexed symbols:\n{symbol_text}")
+}
+
+fn java_symbol(root: &Path, file: &str) -> Option<String> {
+    let path = root.join(file);
+    let contents = fs::read_to_string(path).ok()?;
+    let contents = truncate(&contents, 16_000);
+    let package = contents
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("package ")
+                .and_then(|name| name.strip_suffix(';'))
+        })
+        .unwrap_or("<default>");
+    let kind = ["class", "interface", "record", "enum"]
+        .iter()
+        .find_map(|kind| {
+            contents.lines().find_map(|line| {
+                line.split_whitespace()
+                    .position(|word| word == *kind)
+                    .and_then(|index| {
+                        line.split_whitespace()
+                            .nth(index + 1)
+                            .map(|name| (*kind, name.trim_matches('{').trim_matches('(')))
+                    })
+            })
+        })?;
+    let annotations: Vec<_> = [
+        "@RestController",
+        "@Controller",
+        "@Service",
+        "@Repository",
+        "@Component",
+        "@Configuration",
+        "@SpringBootApplication",
+    ]
+    .iter()
+    .filter(|annotation| contents.contains(**annotation))
+    .copied()
+    .collect();
+    let annotation_text = if annotations.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", annotations.join(", "))
+    };
+    Some(format!(
+        "{file}: {package}.{} {}{annotation_text}",
+        kind.1, kind.0
+    ))
 }
 
 fn design_documents(root: &Path) -> Vec<String> {
@@ -930,5 +1030,27 @@ mod tests {
     #[test]
     fn model_content_rejects_missing_content() {
         assert!(model_content(r#"{"choices":[]}"#).is_err());
+    }
+
+    #[test]
+    fn java_profile_indexes_build_sources_and_spring_symbols() {
+        let root = std::env::temp_dir().join(format!("javora-test-{}", std::process::id()));
+        let source = root.join("src/main/java/example/OrderController.java");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(root.join("pom.xml"), "<project/>").unwrap();
+        fs::write(
+            &source,
+            "package example;\n@RestController\npublic class OrderController {}",
+        )
+        .unwrap();
+        let files = vec![
+            "pom.xml".to_owned(),
+            "src/main/java/example/OrderController.java".to_owned(),
+        ];
+        let profile = java_project_context(&root, &files);
+        assert!(profile.contains("Build: Maven"));
+        assert!(profile.contains("Java sources: 1, tests: 0"));
+        assert!(profile.contains("example.OrderController class [@RestController]"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
