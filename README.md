@@ -18,6 +18,8 @@ Javora 是一个面向 Java 开发者的开源 AI 编程 Agent，采用 Rust 核
 - 自动发现和读取 Markdown、纯文本及常见配置格式的设计文档
 - 从自然语言中识别设计文档并生成实施计划（代码修改前确认）
 - `/implement`：根据设计文档启动实现计划
+- 保留最近对话和最近一次命令结果，供下一轮分析使用
+- 应用代码变更后可确认执行模型建议的测试命令
 
 ### 快速开始
 
@@ -68,6 +70,8 @@ It understands the current project structure and helps developers analyze code, 
 - Design document discovery for Markdown, text, and common configuration files
 - Natural-language design-to-implementation planning with confirmation before edits
 - `/implement` workflow for turning design documents into implementation requests
+- Recent conversation and command-result context for follow-up analysis
+- Optional execution of model-suggested tests after applying changes
 
 ### Quick start
 

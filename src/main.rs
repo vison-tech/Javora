@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const MAX_FILE_BYTES: usize = 512 * 1024;
@@ -25,6 +25,33 @@ struct ChangePlan {
     summary: String,
     changes: Vec<FileChange>,
     tests: Vec<String>,
+}
+
+struct Session {
+    history: Vec<String>,
+    last_command_result: Option<String>,
+}
+
+impl Session {
+    fn new() -> Self {
+        Self {
+            history: Vec::new(),
+            last_command_result: None,
+        }
+    }
+
+    fn remember(&mut self, entry: String) {
+        self.history.push(entry);
+        if self.history.len() > 8 {
+            self.history.remove(0);
+        }
+    }
+
+    fn context(&self) -> String {
+        let history = self.history.join("\n\n");
+        let result = self.last_command_result.as_deref().unwrap_or("");
+        format!("\n\nRecent conversation:\n{history}\n\nLatest command result:\n{result}")
+    }
 }
 
 fn ignored(path: &Path) -> bool {
@@ -124,7 +151,12 @@ fn safe_path(root: &Path, value: &str) -> Option<PathBuf> {
     }
 }
 
-fn model_request(root: &Path, input: &str, document: Option<&str>) -> Option<String> {
+fn model_request(
+    root: &Path,
+    session: &Session,
+    input: &str,
+    document: Option<&str>,
+) -> Option<String> {
     let key = env::var("OPENAI_API_KEY").unwrap_or_default();
     if key.is_empty() {
         println!("OPENAI_API_KEY is not set.");
@@ -136,9 +168,10 @@ fn model_request(root: &Path, input: &str, document: Option<&str>) -> Option<Str
         .map(|d| format!("\n\nDesign document:\n{d}"))
         .unwrap_or_default();
     let prompt = format!(
-        "{}{}\n\nUser task: {input}",
+        "{}{}{}\n\nUser task: {input}",
         project_context(root),
-        document
+        document,
+        session.context(),
     );
     let prompt = prompt
         .replace('\\', "\\\\")
@@ -312,13 +345,17 @@ fn show_plan(root: &Path, plan: &ChangePlan) -> bool {
 }
 
 fn apply_plan(root: &Path, plan: &ChangePlan) -> Result<(), String> {
+    let mut targets = Vec::new();
     for change in &plan.changes {
         let path = write_path(root, &change.path)
             .ok_or_else(|| format!("Unsafe output path: {}", change.path))?;
+        targets.push((path, &change.content));
+    }
+    for (path, content) in targets {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        fs::write(path, &change.content).map_err(|error| error.to_string())?;
+        fs::write(path, content).map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -330,45 +367,77 @@ fn command_allowed(command: &str) -> bool {
         .any(|pattern| normalized.contains(pattern))
 }
 
-fn run_command(root: &Path, command: &str) {
+fn run_command(root: &Path, command: &str) -> Option<String> {
     if !command_allowed(command) {
         println!("Blocked dangerous command. Run it manually if you intend to proceed.");
-        return;
+        return None;
     }
     if !confirm(command) {
         println!("Command skipped.");
-        return;
+        return None;
     }
     match Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(mut child) => {
             let deadline = Instant::now() + Duration::from_secs(120);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        println!("Result: {status}");
-                        break;
-                    }
-                    Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(100))
-                    }
-                    Ok(None) => {
-                        let _ = child.kill();
-                        println!("Command timed out after 120 seconds.");
-                        break;
-                    }
-                    Err(error) => {
-                        println!("Command failed: {error}");
-                        break;
-                    }
-                }
+            while Instant::now() < deadline && child.try_wait().ok().flatten().is_none() {
+                std::thread::sleep(Duration::from_millis(100));
             }
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+                println!("Command timed out after 120 seconds.");
+                return Some(format!("{command}\nTimed out after 120 seconds."));
+            }
+            let output = match child.wait_with_output() {
+                Ok(output) => output,
+                Err(error) => {
+                    println!("Command failed: {error}");
+                    return Some(format!("{command}\nFailed: {error}"));
+                }
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let result = format!(
+                "{command}\nExit status: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                truncate(&stdout, 12_000),
+                truncate(&stderr, 12_000)
+            );
+            println!("Result: {}", output.status);
+            if !stdout.is_empty() {
+                print!("{stdout}");
+            }
+            if !stderr.is_empty() {
+                eprint!("{stderr}");
+            }
+            Some(result)
         }
-        Err(error) => println!("Unable to start command: {error}"),
+        Err(error) => {
+            println!("Unable to start command: {error}");
+            None
+        }
+    }
+}
+
+fn truncate(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        value.to_owned()
+    } else {
+        format!("{}\n... output truncated ...", &value[..limit])
+    }
+}
+
+fn run_suggested_tests(root: &Path, session: &mut Session, tests: &[String]) {
+    for test in tests {
+        if let Some(result) = run_command(root, test) {
+            session.last_command_result = Some(result);
+        }
     }
 }
 
@@ -384,6 +453,7 @@ fn main() {
     println!("Javora 0.3.0 — {}", root.display());
     println!("Type /help for commands, /exit to quit.");
     let stdin = io::stdin();
+    let mut session = Session::new();
     loop {
         print!("\n> ");
         let _ = io::stdout().flush();
@@ -410,23 +480,23 @@ fn main() {
             }
             _ if input.starts_with("/run ") => {
                 let command = input.trim_start_matches("/run ");
-                run_command(&root, command);
+                if let Some(result) = run_command(&root, command) { session.last_command_result = Some(result); }
             }
             _ if input.starts_with("/implement ") || (input.contains("根据") && (input.contains("文档") || input.contains("设计"))) => {
                 let request = input.strip_prefix("/implement ").unwrap_or(input);
                 let matches=find_design(&root,request);
-                if matches.len()==1 { let d=&matches[0]; println!("Design document detected: {d}"); if let Some(doc)=document_text(&root,d) { println!("Design document loaded ({} bytes).",doc.len()); if confirm(&format!("Generate an implementation plan from `{d}`")){ if let Some(response)=model_request(&root, request, Some(&doc)) { match parse_plan(&response) { Ok(plan) if show_plan(&root,&plan) => match apply_plan(&root,&plan) { Ok(())=>println!("Changes applied."), Err(error)=>println!("Apply failed: {error}") }, Ok(_) => println!("Changes discarded."), Err(error)=>println!("Invalid change plan: {error}"), } } } } }
+                if matches.len()==1 { let d=&matches[0]; println!("Design document detected: {d}"); if let Some(doc)=document_text(&root,d) { println!("Design document loaded ({} bytes).",doc.len()); if confirm(&format!("Generate an implementation plan from `{d}`")){ if let Some(response)=model_request(&root, &session, request, Some(&doc)) { match parse_plan(&response) { Ok(plan) if show_plan(&root,&plan) => match apply_plan(&root,&plan) { Ok(())=>{ println!("Changes applied."); run_suggested_tests(&root, &mut session, &plan.tests); }, Err(error)=>println!("Apply failed: {error}") }, Ok(_) => println!("Changes discarded."), Err(error)=>println!("Invalid change plan: {error}"), } } } } }
                 else if matches.is_empty(){println!("No matching design document found. Use /design to list candidates.")} else {println!("Multiple design documents found:"); for d in matches {println!("- {d}")} }
             }
             "/test" => {
                 match test_command(&root) {
-                    Some(command) => run_command(&root, command),
+                    Some(command) => { if let Some(result) = run_command(&root, command) { session.last_command_result = Some(result); } },
                     None => println!("No Maven or Gradle project detected"),
                 }
             }
             "" => {}
             _ => {
-                model_request(&root, input, None);
+                if let Some(answer) = model_request(&root, &session, input, None) { println!("{answer}"); session.remember(format!("User: {input}\nAssistant: {answer}")); }
             }
         }
     }
