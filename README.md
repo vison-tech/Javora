@@ -13,6 +13,7 @@ Javora 是一个面向 Java 开发者的开源 AI 编程 Agent，采用 Rust 核
 - 项目级任务记忆：自动保存需求、方案和当前节点；重启后展示恢复节点，由用户输入 `/resume` 决定继续
 - 自动读取当前项目文件结构
 - OpenAI-compatible 模型接口
+- 稳定的模型协议处理：安全 JSON 编码、Unicode/转义响应解析、Markdown 协议块兼容和无效响应拒绝
 - 支持 OpenAI、Ollama 及其他兼容服务
 - Maven/Gradle 项目和测试命令识别
 - 执行测试前显示命令并请求确认
@@ -69,6 +70,7 @@ It understands the current project structure and helps developers analyze code, 
 - Project task memory: saves the requirement, plan, and current node; after restart Javora displays the node and waits for `/resume`
 - Automatic project file context
 - OpenAI-compatible model API
+- Resilient model protocol handling: safe JSON encoding, Unicode/escaped response parsing, Markdown protocol fence support, and invalid-response rejection
 - Support for OpenAI, Ollama, and compatible providers
 - Maven and Gradle project/test command detection
 - Test execution with confirmation before running commands

@@ -407,6 +407,94 @@ fn safe_path(root: &Path, value: &str) -> Option<PathBuf> {
     }
 }
 
+fn json_escape(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            '\u{0008}' => output.push_str("\\b"),
+            '\u{000C}' => output.push_str("\\f"),
+            character if character.is_control() => {
+                output.push_str(&format!("\\u{:04x}", character as u32))
+            }
+            character => output.push(character),
+        }
+    }
+    output
+}
+
+fn json_string_at(value: &str, start: usize) -> Option<(String, usize)> {
+    let mut index = start;
+    while value.as_bytes().get(index)?.is_ascii_whitespace() {
+        index += 1;
+    }
+    if *value.as_bytes().get(index)? != b'"' {
+        return None;
+    }
+    index += 1;
+    let mut output = String::new();
+    while index < value.len() {
+        let character = value[index..].chars().next()?;
+        index += character.len_utf8();
+        match character {
+            '"' => return Some((output, index)),
+            '\\' => {
+                let escaped = value[index..].chars().next()?;
+                index += escaped.len_utf8();
+                match escaped {
+                    '"' => output.push('"'),
+                    '\\' => output.push('\\'),
+                    '/' => output.push('/'),
+                    'b' => output.push('\u{0008}'),
+                    'f' => output.push('\u{000C}'),
+                    'n' => output.push('\n'),
+                    'r' => output.push('\r'),
+                    't' => output.push('\t'),
+                    'u' => {
+                        let hex = value.get(index..index + 4)?;
+                        let code = u32::from_str_radix(hex, 16).ok()?;
+                        index += 4;
+                        output.push(char::from_u32(code)?);
+                    }
+                    _ => return None,
+                }
+            }
+            character if !character.is_control() => output.push(character),
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn json_field(response: &str, field: &str) -> Option<String> {
+    let marker = format!("\"{field}\"");
+    let mut offset = 0;
+    while let Some(found) = response[offset..].find(&marker) {
+        let after_key = offset + found + marker.len();
+        let colon = response[after_key..].find(':')? + after_key;
+        if let Some((value, _)) = json_string_at(response, colon + 1) {
+            return Some(value);
+        }
+        offset = after_key;
+    }
+    None
+}
+
+fn normalize_model_content(value: String) -> String {
+    let value = value.trim();
+    if let Some(body) = value
+        .strip_prefix("```")
+        .and_then(|text| text.find('\n').map(|index| &text[index + 1..]))
+    {
+        return body.strip_suffix("```").unwrap_or(body).trim().to_owned();
+    }
+    value.to_owned()
+}
+
 fn model_request(
     root: &Path,
     session: &Session,
@@ -436,18 +524,9 @@ fn model_request(
         String::new()
     };
     let prompt = format!("{context}{document}{history}\n\nUser task: {input}");
-    let prompt = prompt
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t");
-    let system = system
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t");
+    let prompt = json_escape(&prompt);
+    let system = json_escape(system);
+    let model = json_escape(&model);
     let body = format!(
         r#"{{"model":"{}","messages":[{{"role":"system","content":"{}"}},{{"role":"user","content":"{}"}}]}}"#,
         model, system, prompt
@@ -468,7 +547,13 @@ fn model_request(
         .output()
     {
         Ok(output) if output.status.success() => {
-            Some(model_content(&String::from_utf8_lossy(&output.stdout)))
+            match model_content(&String::from_utf8_lossy(&output.stdout)) {
+                Ok(content) => Some(content),
+                Err(error) => {
+                    println!("Model response invalid: {error}");
+                    None
+                }
+            }
         }
         Ok(output) => {
             println!(
@@ -484,33 +569,14 @@ fn model_request(
     }
 }
 
-fn model_content(response: &str) -> String {
-    let marker = "\"content\":\"";
-    let Some(start) = response.find(marker).map(|i| i + marker.len()) else {
-        return response.to_owned();
-    };
-    let mut content = String::new();
-    let mut escaped = false;
-    for ch in response[start..].chars() {
-        if escaped {
-            content.push(match ch {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                '\\' => '\\',
-                '"' => '"',
-                other => other,
-            });
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == '"' {
-            break;
-        } else {
-            content.push(ch);
-        }
+fn model_content(response: &str) -> Result<String, String> {
+    if let Some(error) = json_field(response, "error") {
+        return Err(error);
     }
-    content
+    json_field(response, "content")
+        .map(normalize_model_content)
+        .filter(|content| !content.is_empty())
+        .ok_or_else(|| "missing non-empty choices[].message.content".into())
 }
 
 fn test_command(root: &Path) -> Option<&'static str> {
@@ -845,5 +911,24 @@ mod tests {
     fn unclosed_change_content_block_is_rejected() {
         let response = "JAVORA_PLAN\nSUMMARY: add endpoint\nFILE: src/Main.java\n```\nclass Main {}\nEND_JAVORA_PLAN";
         assert!(parse_plan(response).is_err());
+    }
+
+    #[test]
+    fn json_escaping_preserves_control_characters_and_quotes() {
+        assert_eq!(json_escape("a\"\\\n\t"), "a\\\"\\\\\\n\\t");
+    }
+
+    #[test]
+    fn model_content_parses_whitespace_unicode_and_markdown_fence() {
+        let response = r#"{ "choices": [ { "message": { "content" : "```text\nJAVORA_PLAN\nSUMMARY: \u4f60\u597d\n```" } } ] }"#;
+        assert_eq!(
+            model_content(response).unwrap(),
+            "JAVORA_PLAN\nSUMMARY: 你好"
+        );
+    }
+
+    #[test]
+    fn model_content_rejects_missing_content() {
+        assert!(model_content(r#"{"choices":[]}"#).is_err());
     }
 }
