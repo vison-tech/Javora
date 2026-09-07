@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const MAX_FILE_BYTES: usize = 512 * 1024;
+const SESSION_STATE: &str = ".codex/javora-session.state";
 const DANGEROUS_COMMANDS: [&str; 8] = [
     "rm -rf",
     "git reset --hard",
@@ -38,6 +39,7 @@ struct Session {
     history: Vec<String>,
     last_command_result: Option<String>,
     workflow: Workflow,
+    resume_required: bool,
 }
 
 impl Session {
@@ -46,6 +48,7 @@ impl Session {
             history: Vec::new(),
             last_command_result: None,
             workflow: Workflow::Idle,
+            resume_required: false,
         }
     }
 
@@ -60,6 +63,114 @@ impl Session {
         let history = self.history.join("\n\n");
         let result = self.last_command_result.as_deref().unwrap_or("");
         format!("\n\nRecent conversation:\n{history}\n\nLatest command result:\n{result}")
+    }
+}
+
+fn hex_encode(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn hex_decode(value: &str) -> Option<String> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn save_session(root: &Path, session: &Session) -> io::Result<()> {
+    let path = root.join(SESSION_STATE);
+    match &session.workflow {
+        Workflow::Idle => {
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+        }
+        Workflow::Clarifying { transcript } => {
+            fs::create_dir_all(path.parent().expect("state parent"))?;
+            fs::write(
+                path,
+                format!(
+                    "VERSION: 1\nSTATE: CLARIFYING\nTRANSCRIPT: {}\n",
+                    hex_encode(transcript)
+                ),
+            )?;
+        }
+        Workflow::AwaitingApproval { requirement, plan } => {
+            fs::create_dir_all(path.parent().expect("state parent"))?;
+            fs::write(
+                path,
+                format!(
+                    "VERSION: 1\nSTATE: AWAITING_APPROVAL\nREQUIREMENT: {}\nPLAN: {}\n",
+                    hex_encode(requirement),
+                    hex_encode(plan)
+                ),
+            )?;
+        }
+        Workflow::Approved { requirement } => {
+            fs::create_dir_all(path.parent().expect("state parent"))?;
+            fs::write(
+                path,
+                format!(
+                    "VERSION: 1\nSTATE: APPROVED\nREQUIREMENT: {}\n",
+                    hex_encode(requirement)
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn load_session(root: &Path) -> io::Result<Option<Session>> {
+    let path = root.join(SESSION_STATE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path)?;
+    let fields = text
+        .lines()
+        .filter_map(|line| line.split_once(':').map(|(key, value)| (key, value.trim())))
+        .collect::<std::collections::HashMap<_, _>>();
+    if fields.get("VERSION") != Some(&"1") {
+        return Ok(None);
+    }
+    let decode_field = |name: &str| fields.get(name).and_then(|value| hex_decode(value));
+    let workflow = match fields.get("STATE").copied() {
+        Some("CLARIFYING") => match decode_field("TRANSCRIPT") {
+            Some(transcript) => Workflow::Clarifying { transcript },
+            None => return Ok(None),
+        },
+        Some("AWAITING_APPROVAL") => match (decode_field("REQUIREMENT"), decode_field("PLAN")) {
+            (Some(requirement), Some(plan)) => Workflow::AwaitingApproval { requirement, plan },
+            _ => return Ok(None),
+        },
+        Some("APPROVED") => match decode_field("REQUIREMENT") {
+            Some(requirement) => Workflow::Approved { requirement },
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(Session {
+        history: Vec::new(),
+        last_command_result: None,
+        workflow,
+        resume_required: true,
+    }))
+}
+
+fn workflow_status(workflow: &Workflow) -> &'static str {
+    match workflow {
+        Workflow::Idle => "空闲",
+        Workflow::Clarifying { .. } => "需求澄清中",
+        Workflow::AwaitingApproval { .. } => "等待方案确认",
+        Workflow::Approved { .. } => "方案已确认，等待执行",
     }
 }
 
@@ -159,6 +270,9 @@ fn begin_or_continue_requirements(root: &Path, session: &mut Session, input: &st
             println!("无法可靠解析需求分析结果，请重新描述或输入 /new。");
         }
     }
+    if let Err(error) = save_session(root, session) {
+        eprintln!("Unable to save session state: {error}");
+    }
 }
 
 fn execute_approved(root: &Path, session: &mut Session, request: &str) {
@@ -191,6 +305,9 @@ fn execute_approved(root: &Path, session: &mut Session, request: &str) {
         }
     }
     session.workflow = Workflow::Idle;
+    if let Err(error) = save_session(root, session) {
+        eprintln!("Unable to clear session state: {error}");
+    }
 }
 
 fn ignored(path: &Path) -> bool {
@@ -616,7 +733,21 @@ fn main() {
     println!("Javora 0.3.0 — {}", root.display());
     println!("Type /help for commands, /exit to quit.");
     let stdin = io::stdin();
-    let mut session = Session::new();
+    let mut session = match load_session(&root) {
+        Ok(Some(session)) => {
+            println!(
+                "已恢复上次任务节点：{}。不会自动批准或执行。",
+                workflow_status(&session.workflow)
+            );
+            println!("输入 /resume 继续，/new 放弃当前任务，或直接输入反馈。");
+            session
+        }
+        Ok(None) => Session::new(),
+        Err(error) => {
+            eprintln!("Unable to load session state: {error}");
+            Session::new()
+        }
+    };
     loop {
         print!("\n> ");
         let _ = io::stdout().flush();
@@ -628,32 +759,34 @@ fn main() {
         match input {
             "/exit" | "/quit" => break,
             "/help" => println!("/help\n/new\n/files\n/design\n/read <path>\n/search <text>\n/run <command>\n/test\n/implement <request>\n/exit\n\nNatural-language requests always go through clarification first."),
-            "/new" => { session.workflow = Workflow::Idle; println!("Current requirement discarded."); }
-            "/files" | "/design" | "/test" if !matches!(session.workflow, Workflow::Approved { .. }) => {
+            "/resume" => { session.resume_required = false; println!("当前任务节点：{}。请继续回答问题、修改方案，或输入确认；不会自动批准。", workflow_status(&session.workflow)); }
+            "/new" => { session.workflow = Workflow::Idle; let _ = save_session(&root, &session); println!("Current requirement discarded."); }
+            "/files" | "/design" | "/test" if !matches!(session.workflow, Workflow::Approved { .. }) || session.resume_required => {
                 println!("请先完成需求澄清并明确批准方案后再执行此命令。输入 /new 可重新开始。");
             }
             "/files" => println!("{}", project_context(&root)),
             "/design" => { let docs=design_documents(&root); if docs.is_empty(){println!("No design documents detected.")} else { for d in docs {println!("{d}")} } }
             _ if input.starts_with("/read ") => {
-                if !matches!(session.workflow, Workflow::Approved { .. }) { println!("请先完成需求澄清并明确批准方案后再读取项目文件。"); continue; }
+                if !matches!(session.workflow, Workflow::Approved { .. }) || session.resume_required { println!("请先完成需求澄清并明确批准方案后再读取项目文件。"); continue; }
                 let path = input.trim_start_matches("/read ").trim();
                 match safe_path(&root, path).and_then(|p| fs::read_to_string(p).ok()) {
                     Some(contents) => println!("{contents}"), None => println!("File not found or outside project")
                 }
             }
             _ if input.starts_with("/search ") => {
-                if !matches!(session.workflow, Workflow::Approved { .. }) { println!("请先完成需求澄清并明确批准方案后再搜索项目。"); continue; }
+                if !matches!(session.workflow, Workflow::Approved { .. }) || session.resume_required { println!("请先完成需求澄清并明确批准方案后再搜索项目。"); continue; }
                 let query = input.trim_start_matches("/search "); let mut found = Vec::new();
                 let _ = collect_files(&root, &mut found);
                 for file in found { if fs::read_to_string(root.join(&file)).map(|s| s.contains(query)).unwrap_or(false) { println!("{file}"); } }
             }
             _ if input.starts_with("/run ") => {
-                if !matches!(session.workflow, Workflow::Approved { .. }) { println!("请先完成需求澄清并明确批准方案后再运行命令。"); continue; }
+                if !matches!(session.workflow, Workflow::Approved { .. }) || session.resume_required { println!("请先完成需求澄清并明确批准方案后再运行命令。"); continue; }
                 let command = input.trim_start_matches("/run ");
                 if let Some(result) = run_command(&root, command) { session.last_command_result = Some(result); }
             }
             _ if input.starts_with("/implement ") || (input.contains("根据") && (input.contains("文档") || input.contains("设计"))) => {
                 if let Workflow::Approved { requirement } = &session.workflow {
+                    if session.resume_required { println!("任务已恢复但尚未继续。请先输入 /resume。"); continue; }
                     let requirement = requirement.clone();
                     execute_approved(&root, &mut session, &format!("{requirement}\nAdditional request: {input}"));
                 } else {
@@ -672,7 +805,11 @@ fn main() {
                     Workflow::AwaitingApproval { requirement, .. } if confirmed(input) => {
                         let requirement = requirement.clone();
                         session.workflow = Workflow::Approved { requirement: requirement.clone() };
+                        let _ = save_session(&root, &session);
                         execute_approved(&root, &mut session, &requirement);
+                    }
+                    Workflow::Approved { requirement } if session.resume_required => {
+                        println!("任务已恢复但尚未继续。请先输入 /resume，确认当前节点后再执行。");
                     }
                     Workflow::Approved { requirement } => {
                         let requirement = requirement.clone();

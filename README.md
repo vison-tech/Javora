@@ -10,6 +10,7 @@ Javora 是一个面向 Java 开发者的开源 AI 编程 Agent，采用 Rust 核
 
 - 交互式终端对话
 - 强制需求确认：每次仅追问一个关键问题，达到 95% 以上把握后先提交方案，用户确认前不读取项目、不修改文件、不执行命令或测试
+- 项目级任务记忆：自动保存需求、方案和当前节点；重启后展示恢复节点，由用户输入 `/resume` 决定继续
 - 自动读取当前项目文件结构
 - OpenAI-compatible 模型接口
 - 支持 OpenAI、Ollama 及其他兼容服务
@@ -53,6 +54,8 @@ export JAVORA_MODEL="llama3.1"
 
 输入 `/new` 可放弃当前需求并开始新的需求澄清。项目目前处于早期开发阶段，完整工具调用循环正在持续完善。
 
+任务恢复状态保存在项目目录下的 `.codex/javora-session.state`，属于本地运行状态，不应提交到 Git。
+
 ## English
 
 Javora is an open-source AI coding agent for Java developers. It uses a Rust core engine and a TypeScript/Node.js CLI to provide an interactive terminal experience inspired by Codex CLI.
@@ -63,6 +66,7 @@ It understands the current project structure and helps developers analyze code, 
 
 - Interactive terminal REPL
 - Mandatory requirements gate: ask one focused question at a time, present a plan after 95%+ confidence, and do not inspect the project, edit files, run commands, or run tests before explicit approval
+- Project task memory: saves the requirement, plan, and current node; after restart Javora displays the node and waits for `/resume`
 - Automatic project file context
 - OpenAI-compatible model API
 - Support for OpenAI, Ollama, and compatible providers
@@ -105,6 +109,8 @@ Implement the feature based on docs/order-design.md
 ```
 
 Use `/new` to discard the current requirement and begin a new clarification flow. Javora is currently in early development; the complete tool execution loop continues to evolve.
+
+Resume state is stored locally at `.codex/javora-session.state` and should not be committed to Git.
 
 ## Vision
 
