@@ -13,6 +13,7 @@ Javora 是一个面向 Java 开发者的开源 AI 编程 Agent，采用 Rust 核
 - OpenAI-compatible 模型接口
 - 支持 OpenAI、Ollama 及其他兼容服务
 - Maven/Gradle 项目和测试命令识别
+- 执行测试前显示命令并请求确认
 - 面向 Java 工程实践的专家提示词
 - 自动发现和读取 Markdown、纯文本及常见配置格式的设计文档
 - 从自然语言中识别设计文档并生成实施计划（代码修改前确认）
@@ -62,6 +63,7 @@ It understands the current project structure and helps developers analyze code, 
 - OpenAI-compatible model API
 - Support for OpenAI, Ollama, and compatible providers
 - Maven and Gradle project/test command detection
+- Test execution with confirmation before running commands
 - Expert prompt focused on Java engineering practices
 - Design document discovery for Markdown, text, and common configuration files
 - Natural-language design-to-implementation planning with confirmation before edits
@@ -96,7 +98,7 @@ Implement the feature based on docs/order-design.md
 /exit
 ```
 
-Javora is currently in early development. Model integration, file editing, command approvals, and the complete tool execution loop are planned next.
+Javora is currently in early development. Structured model responses, file editing, and the complete tool execution loop are planned next.
 
 ## Vision
 
