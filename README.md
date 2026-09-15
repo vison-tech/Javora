@@ -15,6 +15,7 @@ Javora 是一个面向 Java 开发者的开源 AI 编程 Agent，采用 Rust 核
 - Java 工程画像：识别 Maven/Gradle、模块、源代码与测试规模，并索引包、类型及常见 Spring 注解以生成符合既有风格的代码
 - OpenAI-compatible 模型接口
 - 稳定的模型协议处理：安全 JSON 编码、Unicode/转义响应解析、Markdown 协议块兼容和无效响应拒绝
+- 执行安全策略：设计文档和代码注释按不可信输入处理，方案版本化，失败保留任务，拒绝符号链接写入并进行写入后校验
 - 支持 OpenAI、Ollama 及其他兼容服务
 - Maven/Gradle 项目和测试命令识别
 - 执行测试前显示命令并请求确认
@@ -40,6 +41,18 @@ javora
 export JAVORA_BASE_URL="http://localhost:11434/v1"
 export JAVORA_MODEL="llama3.1"
 ```
+
+使用 Anthropic 原生 Messages API：
+
+```bash
+export JAVORA_PROVIDER="anthropic"
+export ANTHROPIC_API_KEY="your-key"
+export JAVORA_MODEL="your-claude-model"
+# 可选；默认 https://api.anthropic.com/v1
+export JAVORA_BASE_URL="https://api.anthropic.com/v1"
+```
+
+首次运行未设置 Provider 或模型时，Javora 会引导选择 Provider、模型和服务地址，并保存非敏感配置到 `.codex/javora-config`。API Key 仅从环境变量读取，不写入配置文件。
 
 启动后可以直接输入：
 
@@ -73,6 +86,7 @@ It understands the current project structure and helps developers analyze code, 
 - Java project profiling: detects Maven/Gradle, modules, source/test scale, and indexes packages, types, and common Spring annotations to generate code consistent with the project style
 - OpenAI-compatible model API
 - Resilient model protocol handling: safe JSON encoding, Unicode/escaped response parsing, Markdown protocol fence support, and invalid-response rejection
+- Execution safeguards: design documents and source comments are untrusted input, plans are versioned, failures preserve the task, symlink writes are rejected, and writes are verified afterward
 - Support for OpenAI, Ollama, and compatible providers
 - Maven and Gradle project/test command detection
 - Test execution with confirmation before running commands
@@ -98,6 +112,18 @@ For Ollama or another OpenAI-compatible provider:
 export JAVORA_BASE_URL="http://localhost:11434/v1"
 export JAVORA_MODEL="llama3.1"
 ```
+
+For Anthropic's native Messages API:
+
+```bash
+export JAVORA_PROVIDER="anthropic"
+export ANTHROPIC_API_KEY="your-key"
+export JAVORA_MODEL="your-claude-model"
+# Optional; defaults to https://api.anthropic.com/v1
+export JAVORA_BASE_URL="https://api.anthropic.com/v1"
+```
+
+On first use, when no provider or model is configured, Javora guides the user through choosing a provider, model, and base URL. It saves only non-sensitive settings in `.codex/javora-config`; API keys are read only from environment variables.
 
 Example commands:
 
