@@ -52,7 +52,7 @@ export JAVORA_MODEL="your-claude-model"
 export JAVORA_BASE_URL="https://api.anthropic.com/v1"
 ```
 
-首次运行未设置 Provider 或模型时，Javora 会引导选择 Provider、模型和服务地址，并保存非敏感配置到 `.codex/javora-config`。API Key 仅从环境变量读取，不写入配置文件。
+首次运行未设置 Provider 或模型时，Javora 会引导选择 Provider、模型和服务地址，并保存非敏感配置到 `.Javora/javora-config`。API Key 仅从环境变量读取，不写入配置文件。
 
 启动后可以直接输入：
 
@@ -69,7 +69,7 @@ export JAVORA_BASE_URL="https://api.anthropic.com/v1"
 
 输入 `/new` 可放弃当前需求并开始新的需求澄清。项目目前处于早期开发阶段，完整工具调用循环正在持续完善。
 
-任务恢复状态保存在项目目录下的 `.codex/javora-session.state`，属于本地运行状态，不应提交到 Git。
+任务恢复状态保存在项目目录下的 `.Javora/javora-session.state`，属于本地运行状态，不应提交到 Git。旧版本 `.codex` 下的 Javora 状态会在读取后迁移到新目录。
 
 ## English
 
@@ -123,7 +123,7 @@ export JAVORA_MODEL="your-claude-model"
 export JAVORA_BASE_URL="https://api.anthropic.com/v1"
 ```
 
-On first use, when no provider or model is configured, Javora guides the user through choosing a provider, model, and base URL. It saves only non-sensitive settings in `.codex/javora-config`; API keys are read only from environment variables.
+On first use, when no provider or model is configured, Javora guides the user through choosing a provider, model, and base URL. It saves only non-sensitive settings in `.Javora/javora-config`; API keys are read only from environment variables.
 
 Example commands:
 
@@ -140,7 +140,7 @@ Implement the feature based on docs/order-design.md
 
 Use `/new` to discard the current requirement and begin a new clarification flow. Javora is currently in early development; the complete tool execution loop continues to evolve.
 
-Resume state is stored locally at `.codex/javora-session.state` and should not be committed to Git.
+Resume state is stored locally at `.Javora/javora-session.state` and should not be committed to Git. Existing Javora state under `.codex` is read once and migrated to the new directory.
 
 ## Vision
 

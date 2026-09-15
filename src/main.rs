@@ -6,8 +6,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const MAX_FILE_BYTES: usize = 512 * 1024;
-const SESSION_STATE: &str = ".codex/javora-session.state";
-const CONFIG_STATE: &str = ".codex/javora-config";
+const SESSION_STATE: &str = ".Javora/javora-session.state";
+const CONFIG_STATE: &str = ".Javora/javora-config";
+const LEGACY_SESSION_STATE: &str = ".codex/javora-session.state";
+const LEGACY_CONFIG_STATE: &str = ".codex/javora-config";
 const DANGEROUS_COMMANDS: [&str; 8] = [
     "rm -rf",
     "git reset --hard",
@@ -42,6 +44,7 @@ struct ModelConfig {
 
 fn config_value(root: &Path, key: &str) -> Option<String> {
     fs::read_to_string(root.join(CONFIG_STATE))
+        .or_else(|_| fs::read_to_string(root.join(LEGACY_CONFIG_STATE)))
         .ok()?
         .lines()
         .find_map(|line| {
@@ -102,7 +105,7 @@ fn model_config(root: &Path) -> Option<ModelConfig> {
     } else {
         base_url
     };
-    if config_value(root, "model").is_none() {
+    if !root.join(CONFIG_STATE).exists() {
         let provider_name = match provider {
             Provider::OpenAi => "openai",
             Provider::Anthropic => "anthropic",
@@ -233,10 +236,15 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
 
 fn load_session(root: &Path) -> io::Result<Option<Session>> {
     let path = root.join(SESSION_STATE);
+    let path = if path.exists() {
+        path
+    } else {
+        root.join(LEGACY_SESSION_STATE)
+    };
     if !path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(path)?;
+    let text = fs::read_to_string(&path)?;
     let fields = text
         .lines()
         .filter_map(|line| line.split_once(':').map(|(key, value)| (key, value.trim())))
@@ -264,13 +272,17 @@ fn load_session(root: &Path) -> io::Result<Option<Session>> {
         },
         _ => return Ok(None),
     };
-    Ok(Some(Session {
+    let session = Session {
         history: Vec::new(),
         last_command_result: None,
         workflow,
         resume_required: true,
         plan_version,
-    }))
+    };
+    if path == root.join(LEGACY_SESSION_STATE) {
+        let _ = save_session(root, &session);
+    }
+    Ok(Some(session))
 }
 
 fn workflow_status(workflow: &Workflow) -> &'static str {
@@ -428,7 +440,7 @@ fn ignored(path: &Path) -> bool {
     path.components().any(|part| {
         matches!(
             part.as_os_str().to_str(),
-            Some(".git" | ".idea" | ".codex" | "target" | "node_modules")
+            Some(".git" | ".idea" | ".codex" | ".Javora" | "target" | "node_modules")
         )
     })
 }
@@ -1207,6 +1219,20 @@ mod tests {
         assert!(model_content(response)
             .unwrap()
             .starts_with("JAVORA_CLARIFY"));
+    }
+
+    #[test]
+    fn session_state_is_saved_under_javora_directory() {
+        let root = std::env::temp_dir().join(format!("javora-session-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut session = Session::new();
+        session.workflow = Workflow::Clarifying {
+            transcript: "request".to_owned(),
+        };
+        save_session(&root, &session).unwrap();
+        assert!(root.join(SESSION_STATE).exists());
+        assert!(!root.join(LEGACY_SESSION_STATE).exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
