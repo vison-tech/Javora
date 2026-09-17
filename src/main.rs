@@ -6,6 +6,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const MAX_FILE_BYTES: usize = 512 * 1024;
+const MAX_CONTEXT_TOKENS: usize = 200_000;
+const COMPRESSED_CONTEXT_TARGET: usize = 100_000;
 const SESSION_STATE: &str = ".Javora/javora-session.state";
 const CONFIG_STATE: &str = ".Javora/javora-config";
 const LEGACY_SESSION_STATE: &str = ".codex/javora-session.state";
@@ -136,22 +138,43 @@ enum Workflow {
     Approved { requirement: String },
 }
 
+struct ConversationTurn {
+    role: String,
+    content: String,
+    timestamp: u64,
+    turn_type: TurnType,
+}
+
+enum TurnType {
+    UserRequest,
+    AssistantQuestion,
+    AssistantResponse,
+    CommandExecution,
+    FileInspection,
+}
+
 struct Session {
     history: Vec<String>,
+    conversation: Vec<ConversationTurn>,
     last_command_result: Option<String>,
     workflow: Workflow,
     resume_required: bool,
     plan_version: u64,
+    user_context: Vec<String>,
+    compression_count: u32,
 }
 
 impl Session {
     fn new() -> Self {
         Self {
             history: Vec::new(),
+            conversation: Vec::new(),
             last_command_result: None,
             workflow: Workflow::Idle,
             resume_required: false,
             plan_version: 0,
+            user_context: Vec::new(),
+            compression_count: 0,
         }
     }
 
@@ -162,10 +185,160 @@ impl Session {
         }
     }
 
+    fn add_turn(&mut self, role: &str, content: String, turn_type: TurnType) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.conversation.push(ConversationTurn {
+            role: role.to_owned(),
+            content,
+            timestamp,
+            turn_type,
+        });
+        if self.conversation.len() > 20 {
+            self.conversation.remove(0);
+        }
+    }
+
+    fn estimate_tokens(&self) -> usize {
+        let mut total = 0;
+        for turn in &self.conversation {
+            total += turn.content.len() / 4;
+        }
+        for ctx in &self.user_context {
+            total += ctx.len() / 4;
+        }
+        if let Some(result) = &self.last_command_result {
+            total += result.len() / 4;
+        }
+        total
+    }
+
+    fn should_compress(&self) -> bool {
+        self.estimate_tokens() > MAX_CONTEXT_TOKENS
+    }
+
+    fn compress_context(&mut self, root: &Path, config: &ModelConfig) {
+        if !self.should_compress() {
+            return;
+        }
+
+        println!("上下文已超过 {} tokens，正在压缩...", MAX_CONTEXT_TOKENS);
+
+        let summary = self.generate_summary(root, config);
+        if let Some(summary) = summary {
+            let compressed_turn = ConversationTurn {
+                role: "system".to_owned(),
+                content: format!(
+                    "[自动压缩 #{} - {}]\n{}",
+                    self.compression_count + 1,
+                    chrono_now_str(),
+                    summary
+                ),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                turn_type: TurnType::AssistantResponse,
+            };
+
+            let recent_turns: Vec<_> = self
+                .conversation
+                .iter()
+                .rev()
+                .take(5)
+                .rev()
+                .cloned()
+                .collect();
+
+            self.conversation.clear();
+            self.conversation.push(compressed_turn);
+            self.conversation.extend(recent_turns);
+            self.compression_count += 1;
+
+            println!("压缩完成，从 {} 轮对话压缩为摘要 + 最近 5 轮", recent_turns.len() + 1);
+        }
+    }
+
+    fn generate_summary(&self, root: &Path, config: &ModelConfig) -> Option<String> {
+        let mut content = String::new();
+        content.push_str("请总结以下对话历史，提取关键信息：\n\n");
+
+        for (index, turn) in self.conversation.iter().enumerate() {
+            let label = match turn.turn_type {
+                TurnType::UserRequest => "用户",
+                TurnType::AssistantQuestion => "Javora[问题]",
+                TurnType::AssistantResponse => "Javora",
+                TurnType::CommandExecution => "命令结果",
+                TurnType::FileInspection => "文件检查",
+            };
+            let preview = if turn.content.len() > 500 {
+                format!("{}...", &turn.content[..500])
+            } else {
+                turn.content.clone()
+            };
+            content.push_str(&format!("[{}] {}: {}\n\n", index + 1, label, preview));
+        }
+
+        content.push_str("请生成一个简洁的摘要，保留：\n");
+        content.push_str("1. 用户的主要目标和需求\n");
+        content.push_str("2. 已完成的关键操作\n");
+        content.push_str("3. 重要的决策和结论\n");
+        content.push_str("4. 当前进度和待办事项\n");
+
+        let system = "你是 Javora 的会话压缩助手。生成简洁的摘要，去除冗余信息，保留关键上下文。";
+        compress_request(root, config, &content, system)
+    }
+
     fn context(&self) -> String {
         let history = self.history.join("\n\n");
         let result = self.last_command_result.as_deref().unwrap_or("");
         format!("\n\nRecent conversation:\n{history}\n\nLatest command result:\n{result}")
+    }
+
+    fn structured_context(&self) -> String {
+        let mut context = String::new();
+        if !self.user_context.is_empty() {
+            context.push_str("\n\nUser context:\n");
+            context.push_str(&self.user_context.join(", "));
+        }
+        if !self.conversation.is_empty() {
+            context.push_str("\n\nConversation history:\n");
+            for turn in self.conversation.iter().rev().take(10).rev() {
+                let turn_label = match turn.turn_type {
+                    TurnType::UserRequest => "User",
+                    TurnType::AssistantQuestion => "Javora [question]",
+                    TurnType::AssistantResponse => "Javora",
+                    TurnType::CommandExecution => "Command result",
+                    TurnType::FileInspection => "File inspection",
+                };
+                let preview = if turn.content.len() > 200 {
+                    format!("{}...", &turn.content[..200])
+                } else {
+                    turn.content.clone()
+                };
+                context.push_str(&format!("{}: {}\n", turn_label, preview));
+            }
+        }
+        if let Some(result) = &self.last_command_result {
+            let preview = if result.len() > 500 {
+                format!("{}...", &result[..500])
+            } else {
+                result.clone()
+            };
+            context.push_str(&format!("\nLatest command result:\n{}\n", preview));
+        }
+        context
+    }
+
+    fn add_user_context(&mut self, context: String) {
+        if !self.user_context.contains(&context) {
+            self.user_context.push(context);
+            if self.user_context.len() > 5 {
+                self.user_context.remove(0);
+            }
+        }
     }
 }
 
@@ -198,35 +371,86 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
         }
         Workflow::Clarifying { transcript } => {
             fs::create_dir_all(path.parent().expect("state parent"))?;
+            let conversation_encoded = session.conversation.iter()
+                .map(|turn| {
+                    let type_code = match turn.turn_type {
+                        TurnType::UserRequest => "UR",
+                        TurnType::AssistantQuestion => "AQ",
+                        TurnType::AssistantResponse => "AR",
+                        TurnType::CommandExecution => "CE",
+                        TurnType::FileInspection => "FI",
+                    };
+                    format!("{}|{}|{}|{}", type_code, turn.timestamp, turn.role, hex_encode(&turn.content))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let user_context_encoded = hex_encode(&session.user_context.join("||"));
             fs::write(
                 path,
                 format!(
-                    "VERSION: 2\nSTATE: CLARIFYING\nPLAN_VERSION: {}\nTRANSCRIPT: {}\n",
+                    "VERSION: 3\nSTATE: CLARIFYING\nPLAN_VERSION: {}\nCOMPRESSION_COUNT: {}\nTRANSCRIPT: {}\nUSER_CONTEXT: {}\nCONVERSATION:\n{}\n",
                     session.plan_version,
-                    hex_encode(transcript)
+                    session.compression_count,
+                    hex_encode(transcript),
+                    user_context_encoded,
+                    conversation_encoded
                 ),
             )?;
         }
         Workflow::AwaitingApproval { requirement, plan } => {
             fs::create_dir_all(path.parent().expect("state parent"))?;
+            let conversation_encoded = session.conversation.iter()
+                .map(|turn| {
+                    let type_code = match turn.turn_type {
+                        TurnType::UserRequest => "UR",
+                        TurnType::AssistantQuestion => "AQ",
+                        TurnType::AssistantResponse => "AR",
+                        TurnType::CommandExecution => "CE",
+                        TurnType::FileInspection => "FI",
+                    };
+                    format!("{}|{}|{}|{}", type_code, turn.timestamp, turn.role, hex_encode(&turn.content))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let user_context_encoded = hex_encode(&session.user_context.join("||"));
             fs::write(
                 path,
                 format!(
-                    "VERSION: 2\nSTATE: AWAITING_APPROVAL\nPLAN_VERSION: {}\nREQUIREMENT: {}\nPLAN: {}\n",
+                    "VERSION: 3\nSTATE: AWAITING_APPROVAL\nPLAN_VERSION: {}\nCOMPRESSION_COUNT: {}\nREQUIREMENT: {}\nPLAN: {}\nUSER_CONTEXT: {}\nCONVERSATION:\n{}\n",
                     session.plan_version,
+                    session.compression_count,
                     hex_encode(requirement),
-                    hex_encode(plan)
+                    hex_encode(plan),
+                    user_context_encoded,
+                    conversation_encoded
                 ),
             )?;
         }
         Workflow::Approved { requirement } => {
             fs::create_dir_all(path.parent().expect("state parent"))?;
+            let conversation_encoded = session.conversation.iter()
+                .map(|turn| {
+                    let type_code = match turn.turn_type {
+                        TurnType::UserRequest => "UR",
+                        TurnType::AssistantQuestion => "AQ",
+                        TurnType::AssistantResponse => "AR",
+                        TurnType::CommandExecution => "CE",
+                        TurnType::FileInspection => "FI",
+                    };
+                    format!("{}|{}|{}|{}", type_code, turn.timestamp, turn.role, hex_encode(&turn.content))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let user_context_encoded = hex_encode(&session.user_context.join("||"));
             fs::write(
                 path,
                 format!(
-                    "VERSION: 2\nSTATE: APPROVED\nPLAN_VERSION: {}\nREQUIREMENT: {}\n",
+                    "VERSION: 3\nSTATE: APPROVED\nPLAN_VERSION: {}\nCOMPRESSION_COUNT: {}\nREQUIREMENT: {}\nUSER_CONTEXT: {}\nCONVERSATION:\n{}\n",
                     session.plan_version,
-                    hex_encode(requirement)
+                    session.compression_count,
+                    hex_encode(requirement),
+                    user_context_encoded,
+                    conversation_encoded
                 ),
             )?;
         }
@@ -245,18 +469,71 @@ fn load_session(root: &Path) -> io::Result<Option<Session>> {
         return Ok(None);
     }
     let text = fs::read_to_string(&path)?;
-    let fields = text
-        .lines()
-        .filter_map(|line| line.split_once(':').map(|(key, value)| (key, value.trim())))
-        .collect::<std::collections::HashMap<_, _>>();
-    if fields.get("VERSION") != Some(&"2") {
+    let mut lines = text.lines();
+    let mut fields = std::collections::HashMap::new();
+    let mut conversation_lines = Vec::new();
+    let mut in_conversation = false;
+
+    for line in lines {
+        if line.starts_with("CONVERSATION:") {
+            in_conversation = true;
+            continue;
+        }
+        if in_conversation {
+            if !line.is_empty() {
+                conversation_lines.push(line);
+            }
+        } else if let Some((key, value)) = line.split_once(':') {
+            fields.insert(key, value.trim());
+        }
+    }
+
+    let version = fields.get("VERSION").copied().unwrap_or("2");
+    if version != "3" && version != "2" {
         return Ok(None);
     }
+
     let plan_version = fields
         .get("PLAN_VERSION")
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
+    let compression_count = fields
+        .get("COMPRESSION_COUNT")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
     let decode_field = |name: &str| fields.get(name).and_then(|value| hex_decode(value));
+
+    let mut conversation = Vec::new();
+    let mut user_context = Vec::new();
+
+    if version == "3" {
+        if let Some(encoded) = fields.get("USER_CONTEXT").and_then(|v| hex_decode(v)) {
+            user_context = encoded.split("||").filter(|s| !s.is_empty()).map(|s| s.to_owned()).collect();
+        }
+
+        for line in conversation_lines {
+            let parts: Vec<&str> = line.splitn(4, '|').collect();
+            if parts.len() == 4 {
+                let turn_type = match parts[0] {
+                    "UR" => TurnType::UserRequest,
+                    "AQ" => TurnType::AssistantQuestion,
+                    "AR" => TurnType::AssistantResponse,
+                    "CE" => TurnType::CommandExecution,
+                    "FI" => TurnType::FileInspection,
+                    _ => continue,
+                };
+                if let (Ok(timestamp), Some(content)) = (parts[1].parse::<u64>(), hex_decode(parts[3])) {
+                    conversation.push(ConversationTurn {
+                        role: parts[2].to_owned(),
+                        content,
+                        timestamp,
+                        turn_type,
+                    });
+                }
+            }
+        }
+    }
+
     let workflow = match fields.get("STATE").copied() {
         Some("CLARIFYING") => match decode_field("TRANSCRIPT") {
             Some(transcript) => Workflow::Clarifying { transcript },
@@ -274,10 +551,13 @@ fn load_session(root: &Path) -> io::Result<Option<Session>> {
     };
     let session = Session {
         history: Vec::new(),
+        conversation,
         last_command_result: None,
         workflow,
         resume_required: true,
         plan_version,
+        user_context,
+        compression_count,
     };
     if path == root.join(LEGACY_SESSION_STATE) {
         let _ = save_session(root, &session);
@@ -361,11 +641,17 @@ fn question_from(response: &str) -> Option<&str> {
 }
 
 fn begin_or_continue_requirements(root: &Path, session: &mut Session, input: &str) {
+    session.add_turn(“user”, input.to_owned(), TurnType::UserRequest);
+
+    if let Some(config) = model_config(root) {
+        session.compress_context(root, &config);
+    }
+
     let transcript = match &session.workflow {
-        Workflow::Idle => format!("User request: {input}"),
-        Workflow::Clarifying { transcript } => format!("{transcript}\nUser answer: {input}"),
+        Workflow::Idle => format!(“User request: {input}”),
+        Workflow::Clarifying { transcript } => format!(“{transcript}\nUser answer: {input}”),
         Workflow::AwaitingApproval { requirement, plan } => {
-            format!("{requirement}\nUser plan feedback: {input}\nPreviously proposed plan:\n{plan}")
+            format!(“{requirement}\nUser plan feedback: {input}\nPreviously proposed plan:\n{plan}”)
         }
         Workflow::Approved { requirement } => requirement.clone(),
     };
@@ -373,30 +659,36 @@ fn begin_or_continue_requirements(root: &Path, session: &mut Session, input: &st
         return;
     };
     session.remember(format!(
-        "Requirement input: {input}\nRequirements analyst: {response}"
+        “Requirement input: {input}\nRequirements analyst: {response}”
     ));
     match parse_requirement(&response, &transcript) {
         Ok(next @ Workflow::Clarifying { .. }) => {
             if let Some(question) = question_from(&response) {
-                println!("{question}");
+                println!(“{question}”);
+                session.add_turn(“assistant”, question.to_owned(), TurnType::AssistantQuestion);
             }
             session.workflow = next;
         }
         Ok(Workflow::AwaitingApproval { requirement, plan }) => {
-            println!("\n需求已澄清（置信度 ≥95%）。\n{plan}\n\n请回复“确认”批准方案，或直接说明需要调整的内容。");
+            println!(“\n需求已澄清（置信度 ≥95%）。\n{plan}\n\n请回复”确认”批准方案，或直接说明需要调整的内容。”);
+            session.add_turn(“assistant”, plan.clone(), TurnType::AssistantResponse);
             session.workflow = Workflow::AwaitingApproval { requirement, plan };
             session.plan_version = session.plan_version.saturating_add(1);
         }
         Ok(Workflow::Idle | Workflow::Approved { .. }) | Err(_) => {
-            println!("无法可靠解析需求分析结果，请重新描述或输入 /new。");
+            println!(“无法可靠解析需求分析结果，请重新描述或输入 /new。”);
         }
     }
     if let Err(error) = save_session(root, session) {
-        eprintln!("Unable to save session state: {error}");
+        eprintln!(“Unable to save session state: {error}”);
     }
 }
 
 fn execute_approved(root: &Path, session: &mut Session, request: &str) {
+    if let Some(config) = model_config(root) {
+        session.compress_context(root, &config);
+    }
+
     let matches = find_design(root, request);
     let document = if matches.len() == 1 {
         let file = &matches[0];
@@ -721,6 +1013,93 @@ fn normalize_model_content(value: String) -> String {
     value.to_owned()
 }
 
+fn chrono_now_str() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let datetime = now;
+    format!("{}", datetime)
+}
+
+fn compress_request(
+    root: &Path,
+    config: &ModelConfig,
+    content: &str,
+    system: &str,
+) -> Option<String> {
+    let key_name = match config.provider {
+        Provider::OpenAi => "OPENAI_API_KEY",
+        Provider::Anthropic => "ANTHROPIC_API_KEY",
+    };
+    let key = env::var(key_name).unwrap_or_default();
+    if key.is_empty() {
+        return None;
+    }
+
+    let prompt = json_escape(content);
+    let system = json_escape(system);
+    let model = json_escape(&config.model);
+    let (url, body, _, auth_header) = match config.provider {
+        Provider::OpenAi => (
+            format!("{}/chat/completions", config.base_url.trim_end_matches('/')),
+            format!(
+                r#"{{"model":"{model}","messages":[{{"role":"system","content":"{system}"}},{{"role":"user","content":"{prompt}"}}],"max_tokens":1000}}"#
+            ),
+            "openai",
+            format!("Authorization: Bearer {key}"),
+        ),
+        Provider::Anthropic => (
+            format!("{}/messages", config.base_url.trim_end_matches('/')),
+            format!(
+                r#"{{"model":"{model}","max_tokens":1000,"system":"{system}","messages":[{{"role":"user","content":"{prompt}"}}]}}"#
+            ),
+            "anthropic",
+            format!("x-api-key: {key}"),
+        ),
+    };
+    let header_file = env::temp_dir().join(format!("javora-compress-{}", std::process::id()));
+    if fs::write(
+        &header_file,
+        format!(
+            "header = \"{}\"\nheader = \"Content-Type: application/json\"\n{}",
+            auth_header.replace('"', "\\\""),
+            if matches!(config.provider, Provider::Anthropic) {
+                "header = \"anthropic-version: 2023-06-01\"\n"
+            } else {
+                ""
+            }
+        ),
+    )
+    .is_err()
+    {
+        return None;
+    }
+    let output = Command::new("curl")
+        .args([
+            "-fsS",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "60",
+            "--config",
+            header_file.to_str()?,
+            "-X",
+            "POST",
+            &url,
+            "-d",
+            &body,
+        ])
+        .output();
+    let _ = fs::remove_file(&header_file);
+    match output {
+        Ok(output) if output.status.success() => {
+            model_content(&String::from_utf8_lossy(&output.stdout)).ok()
+        }
+        _ => None,
+    }
+}
+
 fn model_request(
     root: &Path,
     session: &Session,
@@ -748,7 +1127,7 @@ fn model_request(
         String::new()
     };
     let history = if include_context {
-        session.context()
+        session.structured_context()
     } else {
         String::new()
     };
@@ -1063,6 +1442,7 @@ fn truncate(value: &str, limit: usize) -> String {
 fn run_suggested_tests(root: &Path, session: &mut Session, tests: &[String]) {
     for test in tests {
         if let Some(result) = run_command(root, test) {
+            session.add_turn("system", result.clone(), TurnType::CommandExecution);
             session.last_command_result = Some(result);
         }
     }
@@ -1117,7 +1497,12 @@ fn main() {
                 if !matches!(session.workflow, Workflow::Approved { .. }) || session.resume_required { println!("请先完成需求澄清并明确批准方案后再读取项目文件。"); continue; }
                 let path = input.trim_start_matches("/read ").trim();
                 match safe_path(&root, path).and_then(|p| fs::read_to_string(p).ok()) {
-                    Some(contents) => println!("{contents}"), None => println!("File not found or outside project")
+                    Some(contents) => {
+                        println!("{contents}");
+                        session.add_turn("system", format!("File inspection: {}", path), TurnType::FileInspection);
+                        session.add_user_context(format!("inspected {}", path));
+                    }
+                    None => println!("File not found or outside project")
                 }
             }
             _ if input.starts_with("/search ") => {
@@ -1129,7 +1514,10 @@ fn main() {
             _ if input.starts_with("/run ") => {
                 if !matches!(session.workflow, Workflow::Approved { .. }) || session.resume_required { println!("请先完成需求澄清并明确批准方案后再运行命令。"); continue; }
                 let command = input.trim_start_matches("/run ");
-                if let Some(result) = run_command(&root, command) { session.last_command_result = Some(result); }
+                if let Some(result) = run_command(&root, command) {
+                    session.add_turn("system", result.clone(), TurnType::CommandExecution);
+                    session.last_command_result = Some(result);
+                }
             }
             _ if input.starts_with("/implement ") || (input.contains("根据") && (input.contains("文档") || input.contains("设计"))) => {
                 if let Workflow::Approved { requirement } = &session.workflow {
@@ -1142,7 +1530,12 @@ fn main() {
             }
             "/test" => {
                 match test_command(&root) {
-                    Some(command) => { if let Some(result) = run_command(&root, command) { session.last_command_result = Some(result); } },
+                    Some(command) => {
+                        if let Some(result) = run_command(&root, command) {
+                            session.add_turn("system", result.clone(), TurnType::CommandExecution);
+                            session.last_command_result = Some(result);
+                        }
+                    },
                     None => println!("No Maven or Gradle project detected"),
                 }
             }
