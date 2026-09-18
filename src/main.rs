@@ -138,6 +138,7 @@ enum Workflow {
     Approved { requirement: String },
 }
 
+#[derive(Clone)]
 struct ConversationTurn {
     role: String,
     content: String,
@@ -145,6 +146,7 @@ struct ConversationTurn {
     turn_type: TurnType,
 }
 
+#[derive(Clone)]
 enum TurnType {
     UserRequest,
     AssistantQuestion,
@@ -252,12 +254,13 @@ impl Session {
                 .cloned()
                 .collect();
 
+            let recent_count = recent_turns.len();
             self.conversation.clear();
             self.conversation.push(compressed_turn);
             self.conversation.extend(recent_turns);
             self.compression_count += 1;
 
-            println!("压缩完成，从 {} 轮对话压缩为摘要 + 最近 5 轮", recent_turns.len() + 1);
+            println!("压缩完成，从 {} 轮对话压缩为摘要 + 最近 5 轮", recent_count + 1);
         }
     }
 
@@ -469,7 +472,7 @@ fn load_session(root: &Path) -> io::Result<Option<Session>> {
         return Ok(None);
     }
     let text = fs::read_to_string(&path)?;
-    let mut lines = text.lines();
+    let lines = text.lines();
     let mut fields = std::collections::HashMap::new();
     let mut conversation_lines = Vec::new();
     let mut in_conversation = false;
@@ -641,17 +644,17 @@ fn question_from(response: &str) -> Option<&str> {
 }
 
 fn begin_or_continue_requirements(root: &Path, session: &mut Session, input: &str) {
-    session.add_turn(“user”, input.to_owned(), TurnType::UserRequest);
+    session.add_turn("user", input.to_owned(), TurnType::UserRequest);
 
     if let Some(config) = model_config(root) {
         session.compress_context(root, &config);
     }
 
     let transcript = match &session.workflow {
-        Workflow::Idle => format!(“User request: {input}”),
-        Workflow::Clarifying { transcript } => format!(“{transcript}\nUser answer: {input}”),
+        Workflow::Idle => format!("User request: {input}"),
+        Workflow::Clarifying { transcript } => format!("{transcript}\nUser answer: {input}"),
         Workflow::AwaitingApproval { requirement, plan } => {
-            format!(“{requirement}\nUser plan feedback: {input}\nPreviously proposed plan:\n{plan}”)
+            format!("{requirement}\nUser plan feedback: {input}\nPreviously proposed plan:\n{plan}")
         }
         Workflow::Approved { requirement } => requirement.clone(),
     };
@@ -659,28 +662,28 @@ fn begin_or_continue_requirements(root: &Path, session: &mut Session, input: &st
         return;
     };
     session.remember(format!(
-        “Requirement input: {input}\nRequirements analyst: {response}”
+        "Requirement input: {input}\nRequirements analyst: {response}"
     ));
     match parse_requirement(&response, &transcript) {
         Ok(next @ Workflow::Clarifying { .. }) => {
             if let Some(question) = question_from(&response) {
-                println!(“{question}”);
-                session.add_turn(“assistant”, question.to_owned(), TurnType::AssistantQuestion);
+                println!("{question}");
+                session.add_turn("assistant", question.to_owned(), TurnType::AssistantQuestion);
             }
             session.workflow = next;
         }
         Ok(Workflow::AwaitingApproval { requirement, plan }) => {
-            println!(“\n需求已澄清（置信度 ≥95%）。\n{plan}\n\n请回复”确认”批准方案，或直接说明需要调整的内容。”);
-            session.add_turn(“assistant”, plan.clone(), TurnType::AssistantResponse);
+            println!("\n需求已澄清（置信度 ≥95%）。\n{plan}\n\n请回复\"确认\"批准方案，或直接说明需要调整的内容。");
+            session.add_turn("assistant", plan.clone(), TurnType::AssistantResponse);
             session.workflow = Workflow::AwaitingApproval { requirement, plan };
             session.plan_version = session.plan_version.saturating_add(1);
         }
         Ok(Workflow::Idle | Workflow::Approved { .. }) | Err(_) => {
-            println!(“无法可靠解析需求分析结果，请重新描述或输入 /new。”);
+            println!("无法可靠解析需求分析结果，请重新描述或输入 /new。");
         }
     }
     if let Err(error) = save_session(root, session) {
-        eprintln!(“Unable to save session state: {error}”);
+        eprintln!("Unable to save session state: {error}");
     }
 }
 
@@ -1023,7 +1026,7 @@ fn chrono_now_str() -> String {
 }
 
 fn compress_request(
-    root: &Path,
+    _root: &Path,
     config: &ModelConfig,
     content: &str,
     system: &str,
