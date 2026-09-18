@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE and local agent settings
+.idea/
+.codex/
+.claude/
+
+# Environment and secrets
+.env
+.env.*
+
+# Test/build artifacts
+.pytest_cache/
+.coverage
+dist/
+build/
+target/
+*.log

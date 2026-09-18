@@ -33,6 +33,62 @@ struct ChangePlan {
     tests: Vec<String>,
 }
 
+#[derive(Clone)]
+struct Task {
+    id: String,
+    name: String,
+    description: String,
+    dependencies: Vec<String>,
+    task_type: TaskType,
+    agent_prompt: String,
+    estimated_complexity: ComplexityLevel,
+}
+
+#[derive(Clone, Debug)]
+enum TaskType {
+    Analysis,
+    Design,
+    Implementation,
+    Testing,
+    Integration,
+}
+
+#[derive(Clone, Debug)]
+enum ComplexityLevel {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone)]
+struct TaskBreakdown {
+    summary: String,
+    tasks: Vec<Task>,
+    execution_strategy: ExecutionStrategy,
+}
+
+#[derive(Clone, Debug)]
+enum ExecutionStrategy {
+    Sequential,
+    Parallel,
+    Mixed,
+}
+
+struct AgentResult {
+    task_id: String,
+    status: AgentStatus,
+    output: String,
+    plan: Option<ChangePlan>,
+    error: Option<String>,
+}
+
+enum AgentStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
 enum Provider {
     OpenAi,
     Anthropic,
@@ -135,6 +191,8 @@ enum Workflow {
     Idle,
     Clarifying { transcript: String },
     AwaitingApproval { requirement: String, plan: String },
+    AwaitingTaskApproval { requirement: String, task_breakdown: TaskBreakdown },
+    AgentExecution { requirement: String, task_breakdown: TaskBreakdown, completed_tasks: Vec<String> },
     Approved { requirement: String },
 }
 
@@ -429,6 +487,68 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
                 ),
             )?;
         }
+        Workflow::AwaitingTaskApproval { requirement, task_breakdown } => {
+            fs::create_dir_all(path.parent().expect("state parent"))?;
+            let conversation_encoded = session.conversation.iter()
+                .map(|turn| {
+                    let type_code = match turn.turn_type {
+                        TurnType::UserRequest => "UR",
+                        TurnType::AssistantQuestion => "AQ",
+                        TurnType::AssistantResponse => "AR",
+                        TurnType::CommandExecution => "CE",
+                        TurnType::FileInspection => "FI",
+                    };
+                    format!("{}|{}|{}|{}", type_code, turn.timestamp, turn.role, hex_encode(&turn.content))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let user_context_encoded = hex_encode(&session.user_context.join("||"));
+            let breakdown_encoded = serialize_task_breakdown(task_breakdown);
+            fs::write(
+                path,
+                format!(
+                    "VERSION: 4\nSTATE: AWAITING_TASK_APPROVAL\nPLAN_VERSION: {}\nCOMPRESSION_COUNT: {}\nREQUIREMENT: {}\nTASK_BREAKDOWN: {}\nUSER_CONTEXT: {}\nCONVERSATION:\n{}\n",
+                    session.plan_version,
+                    session.compression_count,
+                    hex_encode(requirement),
+                    hex_encode(&breakdown_encoded),
+                    user_context_encoded,
+                    conversation_encoded
+                ),
+            )?;
+        }
+        Workflow::AgentExecution { requirement, task_breakdown, completed_tasks } => {
+            fs::create_dir_all(path.parent().expect("state parent"))?;
+            let conversation_encoded = session.conversation.iter()
+                .map(|turn| {
+                    let type_code = match turn.turn_type {
+                        TurnType::UserRequest => "UR",
+                        TurnType::AssistantQuestion => "AQ",
+                        TurnType::AssistantResponse => "AR",
+                        TurnType::CommandExecution => "CE",
+                        TurnType::FileInspection => "FI",
+                    };
+                    format!("{}|{}|{}|{}", type_code, turn.timestamp, turn.role, hex_encode(&turn.content))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let user_context_encoded = hex_encode(&session.user_context.join("||"));
+            let breakdown_encoded = serialize_task_breakdown(task_breakdown);
+            let completed_encoded = hex_encode(&completed_tasks.join("||"));
+            fs::write(
+                path,
+                format!(
+                    "VERSION: 4\nSTATE: AGENT_EXECUTION\nPLAN_VERSION: {}\nCOMPRESSION_COUNT: {}\nREQUIREMENT: {}\nTASK_BREAKDOWN: {}\nCOMPLETED_TASKS: {}\nUSER_CONTEXT: {}\nCONVERSATION:\n{}\n",
+                    session.plan_version,
+                    session.compression_count,
+                    hex_encode(requirement),
+                    hex_encode(&breakdown_encoded),
+                    completed_encoded,
+                    user_context_encoded,
+                    conversation_encoded
+                ),
+            )?;
+        }
         Workflow::Approved { requirement } => {
             fs::create_dir_all(path.parent().expect("state parent"))?;
             let conversation_encoded = session.conversation.iter()
@@ -459,6 +579,87 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn serialize_task_breakdown(breakdown: &TaskBreakdown) -> String {
+    let mut result = format!("SUMMARY:{}\nSTRATEGY:{:?}\nTASKS:\n", breakdown.summary, breakdown.execution_strategy);
+    for task in &breakdown.tasks {
+        result.push_str(&format!(
+            "ID:{}\nNAME:{}\nDESC:{}\nTYPE:{:?}\nCOMPLEXITY:{:?}\nDEPS:{}\nPROMPT:{}\n---\n",
+            task.id,
+            task.name,
+            task.description,
+            task.task_type,
+            task.estimated_complexity,
+            task.dependencies.join(","),
+            task.agent_prompt
+        ));
+    }
+    result
+}
+
+fn deserialize_task_breakdown(data: &str) -> Option<TaskBreakdown> {
+    let lines: Vec<&str> = data.lines().collect();
+    let summary = lines.iter().find_map(|l| l.strip_prefix("SUMMARY:"))?;
+    let strategy_str = lines.iter().find_map(|l| l.strip_prefix("STRATEGY:"))?;
+    let execution_strategy = match strategy_str {
+        "Sequential" => ExecutionStrategy::Sequential,
+        "Parallel" => ExecutionStrategy::Parallel,
+        _ => ExecutionStrategy::Mixed,
+    };
+
+    let mut tasks = Vec::new();
+    let task_sections: Vec<&str> = data.split("---\n").collect();
+
+    for section in task_sections.iter().skip(1) {
+        if section.trim().is_empty() {
+            continue;
+        }
+        let section_lines: Vec<&str> = section.lines().collect();
+        let id = section_lines.iter().find_map(|l| l.strip_prefix("ID:"))?.to_owned();
+        let name = section_lines.iter().find_map(|l| l.strip_prefix("NAME:"))?.to_owned();
+        let description = section_lines.iter().find_map(|l| l.strip_prefix("DESC:"))?.to_owned();
+        let type_str = section_lines.iter().find_map(|l| l.strip_prefix("TYPE:"))?;
+        let complexity_str = section_lines.iter().find_map(|l| l.strip_prefix("COMPLEXITY:"))?;
+        let deps_str = section_lines.iter().find_map(|l| l.strip_prefix("DEPS:"))?.to_owned();
+        let prompt = section_lines.iter().find_map(|l| l.strip_prefix("PROMPT:"))?.to_owned();
+
+        let task_type = match type_str {
+            "Analysis" => TaskType::Analysis,
+            "Design" => TaskType::Design,
+            "Implementation" => TaskType::Implementation,
+            "Testing" => TaskType::Testing,
+            _ => TaskType::Integration,
+        };
+
+        let estimated_complexity = match complexity_str {
+            "Low" => ComplexityLevel::Low,
+            "Medium" => ComplexityLevel::Medium,
+            _ => ComplexityLevel::High,
+        };
+
+        let dependencies: Vec<String> = if deps_str.is_empty() {
+            Vec::new()
+        } else {
+            deps_str.split(',').map(|s| s.to_owned()).collect()
+        };
+
+        tasks.push(Task {
+            id,
+            name,
+            description,
+            dependencies,
+            task_type,
+            agent_prompt: prompt,
+            estimated_complexity,
+        });
+    }
+
+    Some(TaskBreakdown {
+        summary: summary.to_owned(),
+        tasks,
+        execution_strategy,
+    })
 }
 
 fn load_session(root: &Path) -> io::Result<Option<Session>> {
@@ -492,7 +693,7 @@ fn load_session(root: &Path) -> io::Result<Option<Session>> {
     }
 
     let version = fields.get("VERSION").copied().unwrap_or("2");
-    if version != "3" && version != "2" {
+    if version != "4" && version != "3" && version != "2" {
         return Ok(None);
     }
 
@@ -509,7 +710,7 @@ fn load_session(root: &Path) -> io::Result<Option<Session>> {
     let mut conversation = Vec::new();
     let mut user_context = Vec::new();
 
-    if version == "3" {
+    if version == "3" || version == "4" {
         if let Some(encoded) = fields.get("USER_CONTEXT").and_then(|v| hex_decode(v)) {
             user_context = encoded.split("||").filter(|s| !s.is_empty()).map(|s| s.to_owned()).collect();
         }
@@ -546,6 +747,35 @@ fn load_session(root: &Path) -> io::Result<Option<Session>> {
             (Some(requirement), Some(plan)) => Workflow::AwaitingApproval { requirement, plan },
             _ => return Ok(None),
         },
+        Some("AWAITING_TASK_APPROVAL") => {
+            match (decode_field("REQUIREMENT"), decode_field("TASK_BREAKDOWN")) {
+                (Some(requirement), Some(breakdown_data)) => {
+                    if let Some(task_breakdown) = deserialize_task_breakdown(&breakdown_data) {
+                        Workflow::AwaitingTaskApproval { requirement, task_breakdown }
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        Some("AGENT_EXECUTION") => {
+            match (decode_field("REQUIREMENT"), decode_field("TASK_BREAKDOWN"), decode_field("COMPLETED_TASKS")) {
+                (Some(requirement), Some(breakdown_data), Some(completed_data)) => {
+                    if let Some(task_breakdown) = deserialize_task_breakdown(&breakdown_data) {
+                        let completed_tasks: Vec<String> = completed_data
+                            .split("||")
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_owned())
+                            .collect();
+                        Workflow::AgentExecution { requirement, task_breakdown, completed_tasks }
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
         Some("APPROVED") => match decode_field("REQUIREMENT") {
             Some(requirement) => Workflow::Approved { requirement },
             None => return Ok(None),
@@ -573,6 +803,8 @@ fn workflow_status(workflow: &Workflow) -> &'static str {
         Workflow::Idle => "空闲",
         Workflow::Clarifying { .. } => "需求澄清中",
         Workflow::AwaitingApproval { .. } => "等待方案确认",
+        Workflow::AwaitingTaskApproval { .. } => "等待任务分解确认",
+        Workflow::AgentExecution { .. } => "多Agent执行中",
         Workflow::Approved { .. } => "方案已确认，等待执行",
     }
 }
@@ -643,6 +875,341 @@ fn question_from(response: &str) -> Option<&str> {
         .find_map(|line| line.strip_prefix("QUESTION: "))
 }
 
+fn should_decompose(requirement: &str) -> bool {
+    let indicators = [
+        "实现", "开发", "设计并实现", "功能", "模块", "系统",
+        "implement", "develop", "feature", "module", "system"
+    ];
+
+    let word_count = requirement.split_whitespace().count();
+    let has_indicator = indicators.iter().any(|&word| requirement.to_lowercase().contains(word));
+
+    word_count > 20 || has_indicator
+}
+
+fn decompose_task(
+    root: &Path,
+    session: &Session,
+    requirement: &str,
+) -> Option<TaskBreakdown> {
+    let system = "You are Javora's task decomposition expert. Break down the user requirement into sub-tasks.
+Return a structured task breakdown in this format:
+
+JAVORA_TASK_BREAKDOWN
+SUMMARY: overall description
+STRATEGY: Mixed
+
+TASK: task-1
+NAME: Task name
+TYPE: Analysis
+DEPENDENCIES:
+COMPLEXITY: Medium
+DESCRIPTION: Detailed description
+AGENT_PROMPT: Prompt for the agent to execute this task
+
+TASK: task-2
+NAME: Another task
+TYPE: Implementation
+DEPENDENCIES: task-1
+COMPLEXITY: High
+DESCRIPTION: Implementation details
+AGENT_PROMPT: Implement based on analysis...
+
+END_JAVORA_TASK_BREAKDOWN
+
+Valid TYPEs: Analysis, Design, Implementation, Testing, Integration
+Valid COMPLEXITY: Low, Medium, High
+Valid STRATEGY: Sequential, Parallel, Mixed
+DEPENDENCIES: comma-separated task IDs or empty";
+
+    let response = model_request(root, session, requirement, None, system, true)?;
+    parse_task_breakdown(&response).ok()
+}
+
+fn parse_task_breakdown(response: &str) -> Result<TaskBreakdown, String> {
+    let body = response
+        .strip_prefix("JAVORA_TASK_BREAKDOWN\n")
+        .and_then(|text| text.strip_suffix("\nEND_JAVORA_TASK_BREAKDOWN"))
+        .ok_or("Model did not return a task breakdown")?;
+
+    let lines: Vec<&str> = body.lines().collect();
+    let summary = lines.iter()
+        .find_map(|l| l.strip_prefix("SUMMARY: "))
+        .ok_or("Missing SUMMARY")?
+        .to_owned();
+
+    let strategy_str = lines.iter()
+        .find_map(|l| l.strip_prefix("STRATEGY: "))
+        .unwrap_or("Mixed");
+
+    let execution_strategy = match strategy_str {
+        "Sequential" => ExecutionStrategy::Sequential,
+        "Parallel" => ExecutionStrategy::Parallel,
+        _ => ExecutionStrategy::Mixed,
+    };
+
+    let mut tasks = Vec::new();
+    let task_blocks: Vec<&str> = body.split("\nTASK: ").collect();
+
+    for block in task_blocks.iter().skip(1) {
+        let block_lines: Vec<&str> = block.lines().collect();
+        let id = block_lines.first().ok_or("Missing task ID")?.to_string();
+
+        let name = block_lines.iter()
+            .find_map(|l| l.strip_prefix("NAME: "))
+            .ok_or("Missing NAME")?
+            .to_owned();
+
+        let description = block_lines.iter()
+            .find_map(|l| l.strip_prefix("DESCRIPTION: "))
+            .ok_or("Missing DESCRIPTION")?
+            .to_owned();
+
+        let type_str = block_lines.iter()
+            .find_map(|l| l.strip_prefix("TYPE: "))
+            .ok_or("Missing TYPE")?;
+
+        let complexity_str = block_lines.iter()
+            .find_map(|l| l.strip_prefix("COMPLEXITY: "))
+            .ok_or("Missing COMPLEXITY")?;
+
+        let deps_str = block_lines.iter()
+            .find_map(|l| l.strip_prefix("DEPENDENCIES: "))
+            .unwrap_or("");
+
+        let agent_prompt = block_lines.iter()
+            .find_map(|l| l.strip_prefix("AGENT_PROMPT: "))
+            .ok_or("Missing AGENT_PROMPT")?
+            .to_owned();
+
+        let task_type = match type_str {
+            "Analysis" => TaskType::Analysis,
+            "Design" => TaskType::Design,
+            "Implementation" => TaskType::Implementation,
+            "Testing" => TaskType::Testing,
+            _ => TaskType::Integration,
+        };
+
+        let estimated_complexity = match complexity_str {
+            "Low" => ComplexityLevel::Low,
+            "Medium" => ComplexityLevel::Medium,
+            _ => ComplexityLevel::High,
+        };
+
+        let dependencies: Vec<String> = if deps_str.trim().is_empty() {
+            Vec::new()
+        } else {
+            deps_str.split(',').map(|s| s.trim().to_owned()).collect()
+        };
+
+        tasks.push(Task {
+            id,
+            name,
+            description,
+            dependencies,
+            task_type,
+            agent_prompt,
+            estimated_complexity,
+        });
+    }
+
+    if tasks.is_empty() {
+        return Err("No tasks found in breakdown".into());
+    }
+
+    Ok(TaskBreakdown {
+        summary,
+        tasks,
+        execution_strategy,
+    })
+}
+
+fn show_task_breakdown(breakdown: &TaskBreakdown) -> bool {
+    println!("\n=== 任务分解方案 ===");
+    println!("概述：{}", breakdown.summary);
+    println!("\n共 {} 个子任务：", breakdown.tasks.len());
+
+    for (idx, task) in breakdown.tasks.iter().enumerate() {
+        let type_label = match task.task_type {
+            TaskType::Analysis => "分析",
+            TaskType::Design => "设计",
+            TaskType::Implementation => "实现",
+            TaskType::Testing => "测试",
+            TaskType::Integration => "集成",
+        };
+
+        println!("\n{}. {} [{}]", idx + 1, task.name, type_label);
+        println!("   描述：{}", task.description);
+        println!("   复杂度：{:?}", task.estimated_complexity);
+
+        if !task.dependencies.is_empty() {
+            println!("   依赖：{}", task.dependencies.join(", "));
+        }
+    }
+
+    println!("\n执行策略：{:?}", breakdown.execution_strategy);
+    confirm("确认此任务分解方案并开始执行")
+}
+
+fn task_system_prompt(task_type: &TaskType) -> &'static str {
+    match task_type {
+        TaskType::Analysis => "You are a code analysis expert for Javora. Analyze the code and provide insights. Be thorough and specific.",
+        TaskType::Design => "You are a software architect for Javora. Design a clean, maintainable solution following Java best practices.",
+        TaskType::Implementation => "You are Javora's implementation agent. Generate a JAVORA_PLAN with file changes following the exact format.",
+        TaskType::Testing => "You are a testing expert for Javora. Design comprehensive test cases covering edge cases.",
+        TaskType::Integration => "You are an integration expert for Javora. Merge and reconcile results coherently.",
+    }
+}
+
+fn build_task_context(results: &[AgentResult], current_task: &Task) -> String {
+    let mut context = String::new();
+
+    for dep_id in &current_task.dependencies {
+        if let Some(result) = results.iter().find(|r| r.task_id == *dep_id) {
+            context.push_str(&format!("\n### 依赖任务 {} 的输出：\n", dep_id));
+            let preview = if result.output.len() > 2000 {
+                format!("{}...", &result.output[..2000])
+            } else {
+                result.output.clone()
+            };
+            context.push_str(&preview);
+            context.push_str("\n");
+        }
+    }
+
+    context
+}
+
+fn execute_tasks_with_dependencies(
+    root: &Path,
+    session: &mut Session,
+    breakdown: &TaskBreakdown,
+) -> Vec<AgentResult> {
+    use std::collections::HashSet;
+
+    let mut results = Vec::new();
+    let mut completed: HashSet<String> = HashSet::new();
+    let mut remaining: Vec<&Task> = breakdown.tasks.iter().collect();
+
+    while !remaining.is_empty() {
+        let ready: Vec<&Task> = remaining
+            .iter()
+            .filter(|task| {
+                task.dependencies.iter().all(|dep| completed.contains(dep))
+            })
+            .copied()
+            .collect();
+
+        if ready.is_empty() {
+            println!("检测到循环依赖或所有任务均失败，终止执行。");
+            break;
+        }
+
+        for task in ready {
+            println!("\n正在执行任务：{} ...", task.name);
+
+            let context = build_task_context(&results, task);
+            let prompt = if context.is_empty() {
+                task.agent_prompt.clone()
+            } else {
+                format!("{}\n\n前置任务输出：{}", task.agent_prompt, context)
+            };
+
+            let system = task_system_prompt(&task.task_type);
+
+            let response = model_request(root, session, &prompt, None, system, true);
+
+            let result = match response {
+                Some(output) => {
+                    let plan = if matches!(task.task_type, TaskType::Implementation) {
+                        parse_plan(&output).ok()
+                    } else {
+                        None
+                    };
+
+                    completed.insert(task.id.clone());
+
+                    AgentResult {
+                        task_id: task.id.clone(),
+                        status: AgentStatus::Completed,
+                        output,
+                        plan,
+                        error: None,
+                    }
+                }
+                None => AgentResult {
+                    task_id: task.id.clone(),
+                    status: AgentStatus::Failed,
+                    output: String::new(),
+                    plan: None,
+                    error: Some("Model request failed".to_owned()),
+                },
+            };
+
+            if matches!(result.status, AgentStatus::Completed) {
+                println!("  ✓ 完成");
+            } else {
+                println!("  ✗ 失败");
+            }
+
+            results.push(result);
+        }
+
+        remaining.retain(|task| !completed.contains(&task.id));
+    }
+
+    results
+}
+
+fn aggregate_results(
+    _root: &Path,
+    _session: &mut Session,
+    requirement: &str,
+    results: &[AgentResult],
+) -> Option<ChangePlan> {
+    use std::collections::HashMap;
+
+    let mut all_changes: HashMap<String, String> = HashMap::new();
+    let mut all_tests: Vec<String> = Vec::new();
+
+    for result in results {
+        if let Some(plan) = &result.plan {
+            for change in &plan.changes {
+                all_changes.insert(change.path.clone(), change.content.clone());
+            }
+            all_tests.extend(plan.tests.clone());
+        }
+    }
+
+    if !all_changes.is_empty() {
+        let changes: Vec<FileChange> = all_changes
+            .into_iter()
+            .map(|(path, content)| FileChange { path, content })
+            .collect();
+
+        return Some(ChangePlan {
+            summary: format!("多Agent协作完成：{}", requirement),
+            changes,
+            tests: all_tests,
+        });
+    }
+
+    println!("\n=== 所有任务完成 ===");
+    for result in results {
+        if matches!(result.status, AgentStatus::Completed) {
+            println!("\n### 任务 {}", result.task_id);
+            let preview = if result.output.len() > 500 {
+                format!("{}...", &result.output[..500])
+            } else {
+                result.output.clone()
+            };
+            println!("{}", preview);
+        }
+    }
+
+    None
+}
+
 fn begin_or_continue_requirements(root: &Path, session: &mut Session, input: &str) {
     session.add_turn("user", input.to_owned(), TurnType::UserRequest);
 
@@ -656,6 +1223,10 @@ fn begin_or_continue_requirements(root: &Path, session: &mut Session, input: &st
         Workflow::AwaitingApproval { requirement, plan } => {
             format!("{requirement}\nUser plan feedback: {input}\nPreviously proposed plan:\n{plan}")
         }
+        Workflow::AwaitingTaskApproval { requirement, .. } => {
+            format!("{requirement}\nUser feedback on task breakdown: {input}")
+        }
+        Workflow::AgentExecution { requirement, .. } => requirement.clone(),
         Workflow::Approved { requirement } => requirement.clone(),
     };
     let Some(response) = requirement_response(root, session, &transcript) else {
@@ -673,12 +1244,30 @@ fn begin_or_continue_requirements(root: &Path, session: &mut Session, input: &st
             session.workflow = next;
         }
         Ok(Workflow::AwaitingApproval { requirement, plan }) => {
+            if should_decompose(&requirement) {
+                println!("\n检测到复杂任务，尝试自动分解...");
+                if let Some(breakdown) = decompose_task(root, session, &requirement) {
+                    println!("\n任务已分解为 {} 个子任务。", breakdown.tasks.len());
+                    if show_task_breakdown(&breakdown) {
+                        session.workflow = Workflow::AwaitingTaskApproval {
+                            requirement: requirement.clone(),
+                            task_breakdown: breakdown
+                        };
+                        if let Err(error) = save_session(root, session) {
+                            eprintln!("无法保存会话状态: {error}");
+                        }
+                        return;
+                    }
+                }
+                println!("\n任务分解失败或被拒绝，回退到单一执行模式。");
+            }
+
             println!("\n需求已澄清（置信度 ≥95%）。\n{plan}\n\n请回复\"确认\"批准方案，或直接说明需要调整的内容。");
             session.add_turn("assistant", plan.clone(), TurnType::AssistantResponse);
             session.workflow = Workflow::AwaitingApproval { requirement, plan };
             session.plan_version = session.plan_version.saturating_add(1);
         }
-        Ok(Workflow::Idle | Workflow::Approved { .. }) | Err(_) => {
+        Ok(_) | Err(_) => {
             println!("无法可靠解析需求分析结果，请重新描述或输入 /new。");
         }
     }
@@ -1545,6 +2134,31 @@ fn main() {
             "" => {}
             _ => {
                 match &session.workflow {
+                    Workflow::AwaitingTaskApproval { requirement, task_breakdown } if confirmed(input) => {
+                        let breakdown = task_breakdown.clone();
+                        let requirement = requirement.clone();
+
+                        println!("\n开始执行任务分解方案...");
+                        let results = execute_tasks_with_dependencies(&root, &mut session, &breakdown);
+
+                        if let Some(final_plan) = aggregate_results(&root, &mut session, &requirement, &results) {
+                            if show_plan(&root, &final_plan) {
+                                match apply_plan(&root, &final_plan) {
+                                    Ok(()) => {
+                                        println!("多Agent协作完成，代码已应用。");
+                                        run_suggested_tests(&root, &mut session, &final_plan.tests);
+                                    }
+                                    Err(error) => println!("应用失败: {error}"),
+                                }
+                            }
+                        }
+
+                        session.workflow = Workflow::Idle;
+                        let _ = save_session(&root, &session);
+                    }
+                    Workflow::AwaitingTaskApproval { .. } => {
+                        begin_or_continue_requirements(&root, &mut session, input);
+                    }
                     Workflow::AwaitingApproval { requirement, .. } if confirmed(input) => {
                         let requirement = requirement.clone();
                         session.workflow = Workflow::Approved { requirement: requirement.clone() };
