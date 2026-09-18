@@ -1024,10 +1024,9 @@ fn parse_task_breakdown(response: &str) -> Result<TaskBreakdown, String> {
     })
 }
 
-fn show_task_breakdown(breakdown: &TaskBreakdown) -> bool {
-    println!("\n=== 任务分解方案 ===");
-    println!("概述：{}", breakdown.summary);
-    println!("\n共 {} 个子任务：", breakdown.tasks.len());
+fn show_task_breakdown(breakdown: &TaskBreakdown) {
+    println!("\n我建议将这个任务分解为 {} 个子任务：", breakdown.tasks.len());
+    println!("{}\n", breakdown.summary);
 
     for (idx, task) in breakdown.tasks.iter().enumerate() {
         let type_label = match task.task_type {
@@ -1038,17 +1037,27 @@ fn show_task_breakdown(breakdown: &TaskBreakdown) -> bool {
             TaskType::Integration => "集成",
         };
 
-        println!("\n{}. {} [{}]", idx + 1, task.name, type_label);
-        println!("   描述：{}", task.description);
-        println!("   复杂度：{:?}", task.estimated_complexity);
+        println!("{}. {} [{}]", idx + 1, task.name, type_label);
+        println!("   {}", task.description);
 
         if !task.dependencies.is_empty() {
-            println!("   依赖：{}", task.dependencies.join(", "));
+            let dep_names: Vec<String> = breakdown.tasks.iter()
+                .filter(|t| task.dependencies.contains(&t.id))
+                .map(|t| t.name.clone())
+                .collect();
+            if !dep_names.is_empty() {
+                println!("   依赖：{}", dep_names.join("、"));
+            }
         }
     }
 
-    println!("\n执行策略：{:?}", breakdown.execution_strategy);
-    confirm("确认此任务分解方案并开始执行")
+    let strategy_desc = match breakdown.execution_strategy {
+        ExecutionStrategy::Sequential => "按顺序逐个执行",
+        ExecutionStrategy::Parallel => "并行执行所有任务",
+        ExecutionStrategy::Mixed => "根据依赖关系自动调度执行",
+    };
+    println!("\n执行策略：{}", strategy_desc);
+    println!("\n请回复"确认"开始执行，或者说明需要调整的地方。");
 }
 
 fn task_system_prompt(task_type: &TaskType) -> &'static str {
@@ -1101,12 +1110,12 @@ fn execute_tasks_with_dependencies(
             .collect();
 
         if ready.is_empty() {
-            println!("检测到循环依赖或所有任务均失败，终止执行。");
+            println!("\n抱歉，任务之间存在循环依赖或某些任务失败了，无法继续执行。");
             break;
         }
 
         for task in ready {
-            println!("\n正在执行任务：{} ...", task.name);
+            println!("\n开始：{}", task.name);
 
             let context = build_task_context(&results, task);
             let prompt = if context.is_empty() {
@@ -1147,9 +1156,9 @@ fn execute_tasks_with_dependencies(
             };
 
             if matches!(result.status, AgentStatus::Completed) {
-                println!("  ✓ 完成");
+                println!("✓ 完成");
             } else {
-                println!("  ✗ 失败");
+                println!("✗ 失败");
             }
 
             results.push(result);
@@ -1187,6 +1196,8 @@ fn aggregate_results(
             .map(|(path, content)| FileChange { path, content })
             .collect();
 
+        println!("\n所有任务已完成，我已经为你准备好了代码变更。");
+
         return Some(ChangePlan {
             summary: format!("多Agent协作完成：{}", requirement),
             changes,
@@ -1194,10 +1205,10 @@ fn aggregate_results(
         });
     }
 
-    println!("\n=== 所有任务完成 ===");
+    println!("\n好的，所有分析和设计任务都完成了：");
     for result in results {
         if matches!(result.status, AgentStatus::Completed) {
-            println!("\n### 任务 {}", result.task_id);
+            println!("\n【{}】", result.task_id);
             let preview = if result.output.len() > 500 {
                 format!("{}...", &result.output[..500])
             } else {
@@ -1245,24 +1256,21 @@ fn begin_or_continue_requirements(root: &Path, session: &mut Session, input: &st
         }
         Ok(Workflow::AwaitingApproval { requirement, plan }) => {
             if should_decompose(&requirement) {
-                println!("\n检测到复杂任务，尝试自动分解...");
+                println!("\n这是一个较复杂的任务，让我先分解一下...");
                 if let Some(breakdown) = decompose_task(root, session, &requirement) {
-                    println!("\n任务已分解为 {} 个子任务。", breakdown.tasks.len());
-                    if show_task_breakdown(&breakdown) {
-                        session.workflow = Workflow::AwaitingTaskApproval {
-                            requirement: requirement.clone(),
-                            task_breakdown: breakdown
-                        };
-                        if let Err(error) = save_session(root, session) {
-                            eprintln!("无法保存会话状态: {error}");
-                        }
-                        return;
+                    show_task_breakdown(&breakdown);
+                    session.workflow = Workflow::AwaitingTaskApproval {
+                        requirement: requirement.clone(),
+                        task_breakdown: breakdown
+                    };
+                    if let Err(error) = save_session(root, session) {
+                        eprintln!("无法保存会话状态: {error}");
                     }
+                    return;
                 }
-                println!("\n任务分解失败或被拒绝，回退到单一执行模式。");
             }
 
-            println!("\n需求已澄清（置信度 ≥95%）。\n{plan}\n\n请回复\"确认\"批准方案，或直接说明需要调整的内容。");
+            println!("\n好的，我理解了你的需求。\n\n{plan}\n\n请回复\"确认\"开始实现，或者说明需要调整的地方。");
             session.add_turn("assistant", plan.clone(), TurnType::AssistantResponse);
             session.workflow = Workflow::AwaitingApproval { requirement, plan };
             session.plan_version = session.plan_version.saturating_add(1);
@@ -2138,17 +2146,17 @@ fn main() {
                         let breakdown = task_breakdown.clone();
                         let requirement = requirement.clone();
 
-                        println!("\n开始执行任务分解方案...");
+                        println!("\n好的，现在开始执行这些任务...");
                         let results = execute_tasks_with_dependencies(&root, &mut session, &breakdown);
 
                         if let Some(final_plan) = aggregate_results(&root, &mut session, &requirement, &results) {
                             if show_plan(&root, &final_plan) {
                                 match apply_plan(&root, &final_plan) {
                                     Ok(()) => {
-                                        println!("多Agent协作完成，代码已应用。");
+                                        println!("\n代码已应用成功！");
                                         run_suggested_tests(&root, &mut session, &final_plan.tests);
                                     }
-                                    Err(error) => println!("应用失败: {error}"),
+                                    Err(error) => println!("\n抱歉，应用代码时出错了: {error}"),
                                 }
                             }
                         }
