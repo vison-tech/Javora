@@ -3,25 +3,47 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const MAX_FILE_BYTES: usize = 512 * 1024;
 const MAX_CONTEXT_TOKENS: usize = 200_000;
-const COMPRESSED_CONTEXT_TARGET: usize = 100_000;
 const SESSION_STATE: &str = ".Javora/javora-session.state";
 const CONFIG_STATE: &str = ".Javora/javora-config";
 const LEGACY_SESSION_STATE: &str = ".codex/javora-session.state";
 const LEGACY_CONFIG_STATE: &str = ".codex/javora-config";
-const DANGEROUS_COMMANDS: [&str; 8] = [
-    "rm -rf",
-    "git reset --hard",
-    "git clean -f",
-    "mkfs",
-    "dd if=",
-    "> /dev/",
-    "shutdown",
-    "reboot",
-];
+// Whitelist of allowed commands for security
+// See docs/command-security.md for rationale and deployment options.
+#[derive(Debug)]
+enum AllowedCommand {
+    Maven {
+        program: String,
+        subcommand: String,
+        args: Vec<String>,
+    },
+    Gradle {
+        program: String,
+        task: String,
+        args: Vec<String>,
+    },
+    GitRead {
+        subcommand: String,
+        args: Vec<String>,
+    },
+    FileRead {
+        command: String,
+        args: Vec<String>,
+    },
+    JavaTool {
+        tool: String,
+        args: Vec<String>,
+    },
+}
+
+const ALLOWED_MAVEN_SUBCOMMANDS: &[&str] =
+    &["clean", "compile", "test", "package", "install", "verify"];
+const ALLOWED_GRADLE_TASKS: &[&str] = &["build", "test", "assemble", "check", "clean"];
+const ALLOWED_GIT_SUBCOMMANDS: &[&str] = &["status", "log", "diff", "branch", "show"];
+const ALLOWED_FILE_COMMANDS: &[&str] = &["ls", "cat", "find", "grep", "tree", "head", "tail"];
 
 struct FileChange {
     path: String,
@@ -79,12 +101,9 @@ struct AgentResult {
     status: AgentStatus,
     output: String,
     plan: Option<ChangePlan>,
-    error: Option<String>,
 }
 
 enum AgentStatus {
-    Pending,
-    Running,
     Completed,
     Failed,
 }
@@ -189,11 +208,25 @@ fn model_config(root: &Path) -> Option<ModelConfig> {
 
 enum Workflow {
     Idle,
-    Clarifying { transcript: String },
-    AwaitingApproval { requirement: String, plan: String },
-    AwaitingTaskApproval { requirement: String, task_breakdown: TaskBreakdown },
-    AgentExecution { requirement: String, task_breakdown: TaskBreakdown, completed_tasks: Vec<String> },
-    Approved { requirement: String },
+    Clarifying {
+        transcript: String,
+    },
+    AwaitingApproval {
+        requirement: String,
+        plan: String,
+    },
+    AwaitingTaskApproval {
+        requirement: String,
+        task_breakdown: TaskBreakdown,
+    },
+    AgentExecution {
+        requirement: String,
+        task_breakdown: TaskBreakdown,
+        completed_tasks: Vec<String>,
+    },
+    Approved {
+        requirement: String,
+    },
 }
 
 #[derive(Clone)]
@@ -318,7 +351,10 @@ impl Session {
             self.conversation.extend(recent_turns);
             self.compression_count += 1;
 
-            println!("压缩完成，从 {} 轮对话压缩为摘要 + 最近 5 轮", recent_count + 1);
+            println!(
+                "压缩完成，从 {} 轮对话压缩为摘要 + 最近 5 轮",
+                recent_count + 1
+            );
         }
     }
 
@@ -334,11 +370,7 @@ impl Session {
                 TurnType::CommandExecution => "命令结果",
                 TurnType::FileInspection => "文件检查",
             };
-            let preview = if turn.content.len() > 500 {
-                format!("{}...", &turn.content[..500])
-            } else {
-                turn.content.clone()
-            };
+            let preview = truncate(&turn.content, 500);
             content.push_str(&format!("[{}] {}: {}\n\n", index + 1, label, preview));
         }
 
@@ -350,12 +382,6 @@ impl Session {
 
         let system = "你是 Javora 的会话压缩助手。生成简洁的摘要，去除冗余信息，保留关键上下文。";
         compress_request(root, config, &content, system)
-    }
-
-    fn context(&self) -> String {
-        let history = self.history.join("\n\n");
-        let result = self.last_command_result.as_deref().unwrap_or("");
-        format!("\n\nRecent conversation:\n{history}\n\nLatest command result:\n{result}")
     }
 
     fn structured_context(&self) -> String {
@@ -374,20 +400,12 @@ impl Session {
                     TurnType::CommandExecution => "Command result",
                     TurnType::FileInspection => "File inspection",
                 };
-                let preview = if turn.content.len() > 200 {
-                    format!("{}...", &turn.content[..200])
-                } else {
-                    turn.content.clone()
-                };
+                let preview = truncate(&turn.content, 200);
                 context.push_str(&format!("{}: {}\n", turn_label, preview));
             }
         }
         if let Some(result) = &self.last_command_result {
-            let preview = if result.len() > 500 {
-                format!("{}...", &result[..500])
-            } else {
-                result.clone()
-            };
+            let preview = truncate(result, 500);
             context.push_str(&format!("\nLatest command result:\n{}\n", preview));
         }
         context
@@ -432,7 +450,9 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
         }
         Workflow::Clarifying { transcript } => {
             fs::create_dir_all(path.parent().expect("state parent"))?;
-            let conversation_encoded = session.conversation.iter()
+            let conversation_encoded = session
+                .conversation
+                .iter()
                 .map(|turn| {
                     let type_code = match turn.turn_type {
                         TurnType::UserRequest => "UR",
@@ -441,7 +461,13 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
                         TurnType::CommandExecution => "CE",
                         TurnType::FileInspection => "FI",
                     };
-                    format!("{}|{}|{}|{}", type_code, turn.timestamp, turn.role, hex_encode(&turn.content))
+                    format!(
+                        "{}|{}|{}|{}",
+                        type_code,
+                        turn.timestamp,
+                        turn.role,
+                        hex_encode(&turn.content)
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -460,7 +486,9 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
         }
         Workflow::AwaitingApproval { requirement, plan } => {
             fs::create_dir_all(path.parent().expect("state parent"))?;
-            let conversation_encoded = session.conversation.iter()
+            let conversation_encoded = session
+                .conversation
+                .iter()
                 .map(|turn| {
                     let type_code = match turn.turn_type {
                         TurnType::UserRequest => "UR",
@@ -469,7 +497,13 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
                         TurnType::CommandExecution => "CE",
                         TurnType::FileInspection => "FI",
                     };
-                    format!("{}|{}|{}|{}", type_code, turn.timestamp, turn.role, hex_encode(&turn.content))
+                    format!(
+                        "{}|{}|{}|{}",
+                        type_code,
+                        turn.timestamp,
+                        turn.role,
+                        hex_encode(&turn.content)
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -487,9 +521,14 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
                 ),
             )?;
         }
-        Workflow::AwaitingTaskApproval { requirement, task_breakdown } => {
+        Workflow::AwaitingTaskApproval {
+            requirement,
+            task_breakdown,
+        } => {
             fs::create_dir_all(path.parent().expect("state parent"))?;
-            let conversation_encoded = session.conversation.iter()
+            let conversation_encoded = session
+                .conversation
+                .iter()
                 .map(|turn| {
                     let type_code = match turn.turn_type {
                         TurnType::UserRequest => "UR",
@@ -498,7 +537,13 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
                         TurnType::CommandExecution => "CE",
                         TurnType::FileInspection => "FI",
                     };
-                    format!("{}|{}|{}|{}", type_code, turn.timestamp, turn.role, hex_encode(&turn.content))
+                    format!(
+                        "{}|{}|{}|{}",
+                        type_code,
+                        turn.timestamp,
+                        turn.role,
+                        hex_encode(&turn.content)
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -517,9 +562,15 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
                 ),
             )?;
         }
-        Workflow::AgentExecution { requirement, task_breakdown, completed_tasks } => {
+        Workflow::AgentExecution {
+            requirement,
+            task_breakdown,
+            completed_tasks,
+        } => {
             fs::create_dir_all(path.parent().expect("state parent"))?;
-            let conversation_encoded = session.conversation.iter()
+            let conversation_encoded = session
+                .conversation
+                .iter()
                 .map(|turn| {
                     let type_code = match turn.turn_type {
                         TurnType::UserRequest => "UR",
@@ -528,7 +579,13 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
                         TurnType::CommandExecution => "CE",
                         TurnType::FileInspection => "FI",
                     };
-                    format!("{}|{}|{}|{}", type_code, turn.timestamp, turn.role, hex_encode(&turn.content))
+                    format!(
+                        "{}|{}|{}|{}",
+                        type_code,
+                        turn.timestamp,
+                        turn.role,
+                        hex_encode(&turn.content)
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -551,7 +608,9 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
         }
         Workflow::Approved { requirement } => {
             fs::create_dir_all(path.parent().expect("state parent"))?;
-            let conversation_encoded = session.conversation.iter()
+            let conversation_encoded = session
+                .conversation
+                .iter()
                 .map(|turn| {
                     let type_code = match turn.turn_type {
                         TurnType::UserRequest => "UR",
@@ -560,7 +619,13 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
                         TurnType::CommandExecution => "CE",
                         TurnType::FileInspection => "FI",
                     };
-                    format!("{}|{}|{}|{}", type_code, turn.timestamp, turn.role, hex_encode(&turn.content))
+                    format!(
+                        "{}|{}|{}|{}",
+                        type_code,
+                        turn.timestamp,
+                        turn.role,
+                        hex_encode(&turn.content)
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -582,7 +647,10 @@ fn save_session(root: &Path, session: &Session) -> io::Result<()> {
 }
 
 fn serialize_task_breakdown(breakdown: &TaskBreakdown) -> String {
-    let mut result = format!("SUMMARY:{}\nSTRATEGY:{:?}\nTASKS:\n", breakdown.summary, breakdown.execution_strategy);
+    let mut result = format!(
+        "SUMMARY:{}\nSTRATEGY:{:?}\nTASKS:\n",
+        breakdown.summary, breakdown.execution_strategy
+    );
     for task in &breakdown.tasks {
         result.push_str(&format!(
             "ID:{}\nNAME:{}\nDESC:{}\nTYPE:{:?}\nCOMPLEXITY:{:?}\nDEPS:{}\nPROMPT:{}\n---\n",
@@ -616,13 +684,30 @@ fn deserialize_task_breakdown(data: &str) -> Option<TaskBreakdown> {
             continue;
         }
         let section_lines: Vec<&str> = section.lines().collect();
-        let id = section_lines.iter().find_map(|l| l.strip_prefix("ID:"))?.to_owned();
-        let name = section_lines.iter().find_map(|l| l.strip_prefix("NAME:"))?.to_owned();
-        let description = section_lines.iter().find_map(|l| l.strip_prefix("DESC:"))?.to_owned();
+        let id = section_lines
+            .iter()
+            .find_map(|l| l.strip_prefix("ID:"))?
+            .to_owned();
+        let name = section_lines
+            .iter()
+            .find_map(|l| l.strip_prefix("NAME:"))?
+            .to_owned();
+        let description = section_lines
+            .iter()
+            .find_map(|l| l.strip_prefix("DESC:"))?
+            .to_owned();
         let type_str = section_lines.iter().find_map(|l| l.strip_prefix("TYPE:"))?;
-        let complexity_str = section_lines.iter().find_map(|l| l.strip_prefix("COMPLEXITY:"))?;
-        let deps_str = section_lines.iter().find_map(|l| l.strip_prefix("DEPS:"))?.to_owned();
-        let prompt = section_lines.iter().find_map(|l| l.strip_prefix("PROMPT:"))?.to_owned();
+        let complexity_str = section_lines
+            .iter()
+            .find_map(|l| l.strip_prefix("COMPLEXITY:"))?;
+        let deps_str = section_lines
+            .iter()
+            .find_map(|l| l.strip_prefix("DEPS:"))?
+            .to_owned();
+        let prompt = section_lines
+            .iter()
+            .find_map(|l| l.strip_prefix("PROMPT:"))?
+            .to_owned();
 
         let task_type = match type_str {
             "Analysis" => TaskType::Analysis,
@@ -712,7 +797,11 @@ fn load_session(root: &Path) -> io::Result<Option<Session>> {
 
     if version == "3" || version == "4" {
         if let Some(encoded) = fields.get("USER_CONTEXT").and_then(|v| hex_decode(v)) {
-            user_context = encoded.split("||").filter(|s| !s.is_empty()).map(|s| s.to_owned()).collect();
+            user_context = encoded
+                .split("||")
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_owned())
+                .collect();
         }
 
         for line in conversation_lines {
@@ -726,7 +815,9 @@ fn load_session(root: &Path) -> io::Result<Option<Session>> {
                     "FI" => TurnType::FileInspection,
                     _ => continue,
                 };
-                if let (Ok(timestamp), Some(content)) = (parts[1].parse::<u64>(), hex_decode(parts[3])) {
+                if let (Ok(timestamp), Some(content)) =
+                    (parts[1].parse::<u64>(), hex_decode(parts[3]))
+                {
                     conversation.push(ConversationTurn {
                         role: parts[2].to_owned(),
                         content,
@@ -751,7 +842,10 @@ fn load_session(root: &Path) -> io::Result<Option<Session>> {
             match (decode_field("REQUIREMENT"), decode_field("TASK_BREAKDOWN")) {
                 (Some(requirement), Some(breakdown_data)) => {
                     if let Some(task_breakdown) = deserialize_task_breakdown(&breakdown_data) {
-                        Workflow::AwaitingTaskApproval { requirement, task_breakdown }
+                        Workflow::AwaitingTaskApproval {
+                            requirement,
+                            task_breakdown,
+                        }
                     } else {
                         return Ok(None);
                     }
@@ -760,7 +854,11 @@ fn load_session(root: &Path) -> io::Result<Option<Session>> {
             }
         }
         Some("AGENT_EXECUTION") => {
-            match (decode_field("REQUIREMENT"), decode_field("TASK_BREAKDOWN"), decode_field("COMPLETED_TASKS")) {
+            match (
+                decode_field("REQUIREMENT"),
+                decode_field("TASK_BREAKDOWN"),
+                decode_field("COMPLETED_TASKS"),
+            ) {
                 (Some(requirement), Some(breakdown_data), Some(completed_data)) => {
                     if let Some(task_breakdown) = deserialize_task_breakdown(&breakdown_data) {
                         let completed_tasks: Vec<String> = completed_data
@@ -768,7 +866,11 @@ fn load_session(root: &Path) -> io::Result<Option<Session>> {
                             .filter(|s| !s.is_empty())
                             .map(|s| s.to_owned())
                             .collect();
-                        Workflow::AgentExecution { requirement, task_breakdown, completed_tasks }
+                        Workflow::AgentExecution {
+                            requirement,
+                            task_breakdown,
+                            completed_tasks,
+                        }
                     } else {
                         return Ok(None);
                     }
@@ -877,21 +979,28 @@ fn question_from(response: &str) -> Option<&str> {
 
 fn should_decompose(requirement: &str) -> bool {
     let indicators = [
-        "实现", "开发", "设计并实现", "功能", "模块", "系统",
-        "implement", "develop", "feature", "module", "system"
+        "实现",
+        "开发",
+        "设计并实现",
+        "功能",
+        "模块",
+        "系统",
+        "implement",
+        "develop",
+        "feature",
+        "module",
+        "system",
     ];
 
     let word_count = requirement.split_whitespace().count();
-    let has_indicator = indicators.iter().any(|&word| requirement.to_lowercase().contains(word));
+    let has_indicator = indicators
+        .iter()
+        .any(|&word| requirement.to_lowercase().contains(word));
 
     word_count > 20 || has_indicator
 }
 
-fn decompose_task(
-    root: &Path,
-    session: &Session,
-    requirement: &str,
-) -> Option<TaskBreakdown> {
+fn decompose_task(root: &Path, session: &Session, requirement: &str) -> Option<TaskBreakdown> {
     let system = "You are Javora's task decomposition expert. Break down the user requirement into sub-tasks.
 Return a structured task breakdown in this format:
 
@@ -933,12 +1042,14 @@ fn parse_task_breakdown(response: &str) -> Result<TaskBreakdown, String> {
         .ok_or("Model did not return a task breakdown")?;
 
     let lines: Vec<&str> = body.lines().collect();
-    let summary = lines.iter()
+    let summary = lines
+        .iter()
         .find_map(|l| l.strip_prefix("SUMMARY: "))
         .ok_or("Missing SUMMARY")?
         .to_owned();
 
-    let strategy_str = lines.iter()
+    let strategy_str = lines
+        .iter()
         .find_map(|l| l.strip_prefix("STRATEGY: "))
         .unwrap_or("Mixed");
 
@@ -955,29 +1066,35 @@ fn parse_task_breakdown(response: &str) -> Result<TaskBreakdown, String> {
         let block_lines: Vec<&str> = block.lines().collect();
         let id = block_lines.first().ok_or("Missing task ID")?.to_string();
 
-        let name = block_lines.iter()
+        let name = block_lines
+            .iter()
             .find_map(|l| l.strip_prefix("NAME: "))
             .ok_or("Missing NAME")?
             .to_owned();
 
-        let description = block_lines.iter()
+        let description = block_lines
+            .iter()
             .find_map(|l| l.strip_prefix("DESCRIPTION: "))
             .ok_or("Missing DESCRIPTION")?
             .to_owned();
 
-        let type_str = block_lines.iter()
+        let type_str = block_lines
+            .iter()
             .find_map(|l| l.strip_prefix("TYPE: "))
             .ok_or("Missing TYPE")?;
 
-        let complexity_str = block_lines.iter()
+        let complexity_str = block_lines
+            .iter()
             .find_map(|l| l.strip_prefix("COMPLEXITY: "))
             .ok_or("Missing COMPLEXITY")?;
 
-        let deps_str = block_lines.iter()
+        let deps_str = block_lines
+            .iter()
             .find_map(|l| l.strip_prefix("DEPENDENCIES: "))
             .unwrap_or("");
 
-        let agent_prompt = block_lines.iter()
+        let agent_prompt = block_lines
+            .iter()
             .find_map(|l| l.strip_prefix("AGENT_PROMPT: "))
             .ok_or("Missing AGENT_PROMPT")?
             .to_owned();
@@ -1017,6 +1134,18 @@ fn parse_task_breakdown(response: &str) -> Result<TaskBreakdown, String> {
         return Err("No tasks found in breakdown".into());
     }
 
+    let known_ids: std::collections::HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    for task in &tasks {
+        for dep in &task.dependencies {
+            if dep == &task.id {
+                return Err(format!("Task {} depends on itself", task.id));
+            }
+            if !known_ids.contains(dep.as_str()) {
+                return Err(format!("Task {} depends on unknown task {}", task.id, dep));
+            }
+        }
+    }
+
     Ok(TaskBreakdown {
         summary,
         tasks,
@@ -1025,7 +1154,10 @@ fn parse_task_breakdown(response: &str) -> Result<TaskBreakdown, String> {
 }
 
 fn show_task_breakdown(breakdown: &TaskBreakdown) {
-    println!("\n我建议将这个任务分解为 {} 个子任务：", breakdown.tasks.len());
+    println!(
+        "\n我建议将这个任务分解为 {} 个子任务：",
+        breakdown.tasks.len()
+    );
     println!("{}\n", breakdown.summary);
 
     for (idx, task) in breakdown.tasks.iter().enumerate() {
@@ -1041,7 +1173,9 @@ fn show_task_breakdown(breakdown: &TaskBreakdown) {
         println!("   {}", task.description);
 
         if !task.dependencies.is_empty() {
-            let dep_names: Vec<String> = breakdown.tasks.iter()
+            let dep_names: Vec<String> = breakdown
+                .tasks
+                .iter()
                 .filter(|t| task.dependencies.contains(&t.id))
                 .map(|t| t.name.clone())
                 .collect();
@@ -1057,7 +1191,7 @@ fn show_task_breakdown(breakdown: &TaskBreakdown) {
         ExecutionStrategy::Mixed => "根据依赖关系自动调度执行",
     };
     println!("\n执行策略：{}", strategy_desc);
-    println!("\n请回复"确认"开始执行，或者说明需要调整的地方。");
+    println!("\n请回复「确认」开始执行，或者说明需要调整的地方。");
 }
 
 fn task_system_prompt(task_type: &TaskType) -> &'static str {
@@ -1076,13 +1210,9 @@ fn build_task_context(results: &[AgentResult], current_task: &Task) -> String {
     for dep_id in &current_task.dependencies {
         if let Some(result) = results.iter().find(|r| r.task_id == *dep_id) {
             context.push_str(&format!("\n### 依赖任务 {} 的输出：\n", dep_id));
-            let preview = if result.output.len() > 2000 {
-                format!("{}...", &result.output[..2000])
-            } else {
-                result.output.clone()
-            };
+            let preview = truncate(&result.output, 2000);
             context.push_str(&preview);
-            context.push_str("\n");
+            context.push('\n');
         }
     }
 
@@ -1098,19 +1228,49 @@ fn execute_tasks_with_dependencies(
 
     let mut results = Vec::new();
     let mut completed: HashSet<String> = HashSet::new();
+    let mut failed: HashSet<String> = HashSet::new();
     let mut remaining: Vec<&Task> = breakdown.tasks.iter().collect();
 
     while !remaining.is_empty() {
+        let blocked: Vec<&Task> = remaining
+            .iter()
+            .filter(|task| task.dependencies.iter().any(|dep| failed.contains(dep)))
+            .copied()
+            .collect();
+
+        for task in &blocked {
+            println!("\n跳过：{}（依赖的任务未成功完成）", task.name);
+            failed.insert(task.id.clone());
+            results.push(AgentResult {
+                task_id: task.id.clone(),
+                status: AgentStatus::Failed,
+                output: String::new(),
+                plan: None,
+            });
+        }
+
+        if !blocked.is_empty() {
+            remaining.retain(|task| !failed.contains(&task.id));
+            continue;
+        }
+
         let ready: Vec<&Task> = remaining
             .iter()
-            .filter(|task| {
-                task.dependencies.iter().all(|dep| completed.contains(dep))
-            })
+            .filter(|task| task.dependencies.iter().all(|dep| completed.contains(dep)))
             .copied()
             .collect();
 
         if ready.is_empty() {
-            println!("\n抱歉，任务之间存在循环依赖或某些任务失败了，无法继续执行。");
+            println!("\n抱歉，任务之间存在循环依赖，无法继续执行。");
+            for task in &remaining {
+                failed.insert(task.id.clone());
+                results.push(AgentResult {
+                    task_id: task.id.clone(),
+                    status: AgentStatus::Failed,
+                    output: String::new(),
+                    plan: None,
+                });
+            }
             break;
         }
 
@@ -1121,7 +1281,11 @@ fn execute_tasks_with_dependencies(
             let prompt = if context.is_empty() {
                 task.agent_prompt.clone()
             } else {
-                format!("{}\n\n前置任务输出：{}", task.agent_prompt, context)
+                format!(
+                    "{}\n\n前置任务输出：{}",
+                    task.agent_prompt,
+                    truncate(&context, 2000)
+                )
             };
 
             let system = task_system_prompt(&task.task_type);
@@ -1143,16 +1307,17 @@ fn execute_tasks_with_dependencies(
                         status: AgentStatus::Completed,
                         output,
                         plan,
-                        error: None,
                     }
                 }
-                None => AgentResult {
-                    task_id: task.id.clone(),
-                    status: AgentStatus::Failed,
-                    output: String::new(),
-                    plan: None,
-                    error: Some("Model request failed".to_owned()),
-                },
+                None => {
+                    failed.insert(task.id.clone());
+                    AgentResult {
+                        task_id: task.id.clone(),
+                        status: AgentStatus::Failed,
+                        output: String::new(),
+                        plan: None,
+                    }
+                }
             };
 
             if matches!(result.status, AgentStatus::Completed) {
@@ -1164,7 +1329,7 @@ fn execute_tasks_with_dependencies(
             results.push(result);
         }
 
-        remaining.retain(|task| !completed.contains(&task.id));
+        remaining.retain(|task| !completed.contains(&task.id) && !failed.contains(&task.id));
     }
 
     results
@@ -1209,11 +1374,7 @@ fn aggregate_results(
     for result in results {
         if matches!(result.status, AgentStatus::Completed) {
             println!("\n【{}】", result.task_id);
-            let preview = if result.output.len() > 500 {
-                format!("{}...", &result.output[..500])
-            } else {
-                result.output.clone()
-            };
+            let preview = truncate(&result.output, 500);
             println!("{}", preview);
         }
     }
@@ -1250,7 +1411,11 @@ fn begin_or_continue_requirements(root: &Path, session: &mut Session, input: &st
         Ok(next @ Workflow::Clarifying { .. }) => {
             if let Some(question) = question_from(&response) {
                 println!("{question}");
-                session.add_turn("assistant", question.to_owned(), TurnType::AssistantQuestion);
+                session.add_turn(
+                    "assistant",
+                    question.to_owned(),
+                    TurnType::AssistantQuestion,
+                );
             }
             session.workflow = next;
         }
@@ -1261,7 +1426,7 @@ fn begin_or_continue_requirements(root: &Path, session: &mut Session, input: &st
                     show_task_breakdown(&breakdown);
                     session.workflow = Workflow::AwaitingTaskApproval {
                         requirement: requirement.clone(),
-                        task_breakdown: breakdown
+                        task_breakdown: breakdown,
                     };
                     if let Err(error) = save_session(root, session) {
                         eprintln!("无法保存会话状态: {error}");
@@ -1346,6 +1511,12 @@ fn collect_files(root: &Path, output: &mut Vec<String>) -> io::Result<()> {
         let path = entry.path();
         if ignored(&path) {
             continue;
+        }
+        // Reject symlinks to prevent following links outside project or circular references
+        if let Ok(metadata) = path.symlink_metadata() {
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
         }
         if path.is_dir() {
             collect_files(&path, output)?;
@@ -1889,6 +2060,22 @@ fn parse_plan(response: &str) -> Result<ChangePlan, String> {
 }
 
 fn write_path(root: &Path, value: &str) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let path_obj = Path::new(value);
+
+    // Explicitly reject absolute paths
+    if path_obj.is_absolute() {
+        return None;
+    }
+
+    // Explicitly reject paths containing parent directory components
+    for component in path_obj.components() {
+        if matches!(component, Component::ParentDir) {
+            return None;
+        }
+    }
+
     let root = root.canonicalize().ok()?;
     let path = root.join(value);
     let parent = path.parent()?;
@@ -1966,67 +2153,368 @@ fn apply_plan(root: &Path, plan: &ChangePlan) -> Result<(), String> {
     Ok(())
 }
 
-fn command_allowed(command: &str) -> bool {
-    let normalized = command.to_lowercase();
-    !DANGEROUS_COMMANDS
+fn has_shell_metacharacters(s: &str) -> bool {
+    // Detect shell injection attempts
+    s.contains('|')
+        || s.contains(';')
+        || s.contains('&')
+        || s.contains('$')
+        || s.contains('`')
+        || s.contains('>')
+        || s.contains('<')
+        || s.contains('*')
+        || s.contains('?')
+        || s.contains('[')
+        || s.contains(']')
+        || s.contains('(')
+        || s.contains(')')
+        || s.contains('{')
+        || s.contains('}')
+        || s.contains('\\')
+        || s.contains('"')
+        || s.contains('\'')
+}
+
+fn has_outside_project_path(arg: &str) -> bool {
+    use std::path::Component;
+
+    let candidate = arg.split_once('=').map_or(arg, |(_, value)| value);
+    let path = Path::new(candidate);
+    path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+        || (candidate.len() >= 3
+            && candidate.as_bytes()[0].is_ascii_alphabetic()
+            && candidate.as_bytes()[1] == b':'
+            && matches!(candidate.as_bytes()[2], b'/' | b'\\'))
+}
+
+fn validate_plain_args(args: &[String]) -> Result<(), String> {
+    for arg in args {
+        if has_shell_metacharacters(arg) {
+            return Err(format!(
+                "Shell metacharacters not allowed in arguments: {}",
+                arg
+            ));
+        }
+        if has_outside_project_path(arg) {
+            return Err(format!(
+                "Paths outside the project are not allowed in command arguments: {}",
+                arg
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_git_args(subcommand: &str, args: &[String]) -> Result<(), String> {
+    validate_plain_args(args)?;
+
+    if subcommand == "branch" && !args.is_empty() {
+        return Err("Git branch arguments are blocked because they can modify refs".to_string());
+    }
+
+    const BLOCKED_GIT_ARGS: &[&str] = &["--output", "--ext-diff", "--textconv"];
+    if let Some(arg) = args
         .iter()
-        .any(|pattern| normalized.contains(pattern))
+        .find(|arg| BLOCKED_GIT_ARGS.contains(&arg.as_str()) || arg.starts_with("--output="))
+    {
+        return Err(format!(
+            "Git argument '{}' is blocked because it can write files or execute helpers",
+            arg
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_file_args(command: &str, args: &[String]) -> Result<(), String> {
+    validate_plain_args(args)?;
+
+    if command == "find" {
+        const BLOCKED_FIND_ACTIONS: &[&str] = &[
+            "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprint0",
+            "-fprintf",
+        ];
+        if let Some(arg) = args
+            .iter()
+            .find(|arg| BLOCKED_FIND_ACTIONS.contains(&arg.as_str()))
+        {
+            return Err(format!(
+                "Find action '{}' is blocked because it can modify files or execute commands",
+                arg
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_and_validate_command(command: &str) -> Result<AllowedCommand, String> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Err("Empty command".to_string());
+    }
+
+    // Split on whitespace to get command parts
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err("Empty command".to_string());
+    }
+
+    let cmd = parts[0];
+    let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+
+    // Check for shell metacharacters in the base command
+    if has_shell_metacharacters(cmd) {
+        return Err(format!(
+            "Shell metacharacters not allowed in command: {}",
+            cmd
+        ));
+    }
+
+    // Maven
+    if cmd == "mvn" || cmd == "./mvnw" {
+        if args.is_empty() {
+            return Err("Maven requires a subcommand".to_string());
+        }
+        let subcommand = &args[0];
+        if !ALLOWED_MAVEN_SUBCOMMANDS.contains(&subcommand.as_str()) {
+            return Err(format!(
+                "Maven subcommand '{}' not allowed. Allowed: {:?}",
+                subcommand, ALLOWED_MAVEN_SUBCOMMANDS
+            ));
+        }
+        validate_plain_args(&args)?;
+        return Ok(AllowedCommand::Maven {
+            program: cmd.to_string(),
+            subcommand: subcommand.clone(),
+            args: args[1..].to_vec(),
+        });
+    }
+
+    // Gradle
+    if cmd == "gradle" || cmd == "./gradlew" {
+        if args.is_empty() {
+            return Err("Gradle requires a task".to_string());
+        }
+        let task = &args[0];
+        if !ALLOWED_GRADLE_TASKS.contains(&task.as_str()) {
+            return Err(format!(
+                "Gradle task '{}' not allowed. Allowed: {:?}",
+                task, ALLOWED_GRADLE_TASKS
+            ));
+        }
+        validate_plain_args(&args)?;
+        return Ok(AllowedCommand::Gradle {
+            program: cmd.to_string(),
+            task: task.clone(),
+            args: args[1..].to_vec(),
+        });
+    }
+
+    // Git (read-only operations)
+    if cmd == "git" {
+        if args.is_empty() {
+            return Err("Git requires a subcommand".to_string());
+        }
+        let subcommand = &args[0];
+        if !ALLOWED_GIT_SUBCOMMANDS.contains(&subcommand.as_str()) {
+            return Err(format!(
+                "Git subcommand '{}' not allowed. Allowed: {:?}",
+                subcommand, ALLOWED_GIT_SUBCOMMANDS
+            ));
+        }
+        validate_git_args(subcommand, &args[1..])?;
+        return Ok(AllowedCommand::GitRead {
+            subcommand: subcommand.clone(),
+            args: args[1..].to_vec(),
+        });
+    }
+
+    // File read operations
+    if ALLOWED_FILE_COMMANDS.contains(&cmd) {
+        validate_file_args(cmd, &args)?;
+        return Ok(AllowedCommand::FileRead {
+            command: cmd.to_string(),
+            args,
+        });
+    }
+
+    // Java runtime and compiler execution is restricted to version inspection.
+    if matches!(cmd, "java" | "javac" | "jshell") {
+        validate_plain_args(&args)?;
+        if args.len() != 1 || !matches!(args[0].as_str(), "-version" | "--version") {
+            return Err(format!(
+                "{} is restricted to -version/--version; use Maven or Gradle for approved builds and tests",
+                cmd
+            ));
+        }
+        return Ok(AllowedCommand::JavaTool {
+            tool: cmd.to_string(),
+            args,
+        });
+    }
+
+    // javap inspects class files but must not pass arbitrary options to its JVM.
+    if cmd == "javap" {
+        validate_plain_args(&args)?;
+        if args.iter().any(|arg| arg.starts_with("-J")) {
+            return Err(
+                "javap -J options are blocked because they can execute JVM agents".to_string(),
+            );
+        }
+        return Ok(AllowedCommand::JavaTool {
+            tool: cmd.to_string(),
+            args,
+        });
+    }
+
+    Err(format!(
+        "Command '{}' not in whitelist. Allowed: Maven, Gradle, Git (read-only), file read commands, and restricted Java inspection. See docs/command-security.md",
+        cmd
+    ))
+}
+
+fn execute_allowed_command(allowed: &AllowedCommand, root: &Path) -> Result<String, String> {
+    let mut cmd = match allowed {
+        AllowedCommand::Maven {
+            program,
+            subcommand,
+            args,
+        } => {
+            let mut c = Command::new(program);
+            c.arg(subcommand);
+            c.args(args);
+            c
+        }
+        AllowedCommand::Gradle {
+            program,
+            task,
+            args,
+        } => {
+            let mut c = Command::new(program);
+            c.arg(task);
+            c.args(args);
+            c
+        }
+        AllowedCommand::GitRead { subcommand, args } => {
+            let mut c = Command::new("git");
+            c.arg(subcommand);
+            c.args(args);
+            c
+        }
+        AllowedCommand::FileRead { command, args } => {
+            let mut c = Command::new(command);
+            c.args(args);
+            c
+        }
+        AllowedCommand::JavaTool { tool, args } => {
+            let mut c = Command::new(tool);
+            c.args(args);
+            c
+        }
+    };
+
+    cmd.current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    match cmd.spawn() {
+        Ok(child) => {
+            let pid = child.id();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = child.wait_with_output();
+                let _ = tx.send(result);
+            });
+
+            let output = match rx.recv_timeout(Duration::from_secs(120)) {
+                Ok(Ok(output)) => output,
+                Ok(Err(error)) => {
+                    return Err(format!("Command failed: {}", error));
+                }
+                Err(_) => {
+                    kill_process_tree(pid);
+                    return Err("Command timed out after 120 seconds".to_string());
+                }
+            };
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(format!(
+                "Exit status: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                truncate(&stdout, 12_000),
+                truncate(&stderr, 12_000)
+            ))
+        }
+        Err(error) => Err(format!("Unable to start command: {}", error)),
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_tree(pid: u32) {
+    // The command is its own process group leader, so a negative pid reaches descendants.
+    let _ = Command::new("kill")
+        .arg("-9")
+        .arg(format!("-{pid}"))
+        .status();
+}
+
+#[cfg(windows)]
+fn kill_process_tree(pid: u32) {
+    let _ = Command::new("taskkill")
+        .arg("/PID")
+        .arg(pid.to_string())
+        .args(["/T", "/F"])
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn kill_process_tree(_pid: u32) {
+    eprintln!("Process-tree termination is unsupported on this platform");
 }
 
 fn run_command(root: &Path, command: &str) -> Option<String> {
-    if !command_allowed(command) {
-        println!("Blocked dangerous command. Run it manually if you intend to proceed.");
-        return None;
-    }
+    // Parse and validate command against whitelist
+    let allowed_cmd = match parse_and_validate_command(command) {
+        Ok(cmd) => cmd,
+        Err(err) => {
+            println!("❌ Command blocked: {}", err);
+            println!("💡 See docs/command-security.md for the command policy.");
+            return None;
+        }
+    };
+
+    // User confirmation
     if !confirm(command) {
         println!("Command skipped.");
         return None;
     }
-    match Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(mut child) => {
-            let deadline = Instant::now() + Duration::from_secs(120);
-            while Instant::now() < deadline && child.try_wait().ok().flatten().is_none() {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if child.try_wait().ok().flatten().is_none() {
-                let _ = child.kill();
-                println!("Command timed out after 120 seconds.");
-                return Some(format!("{command}\nTimed out after 120 seconds."));
-            }
-            let output = match child.wait_with_output() {
-                Ok(output) => output,
-                Err(error) => {
-                    println!("Command failed: {error}");
-                    return Some(format!("{command}\nFailed: {error}"));
+
+    // Execute using parameterized command (not shell string)
+    match execute_allowed_command(&allowed_cmd, root) {
+        Ok(output) => {
+            println!("✅ Command completed");
+            // Print output for user (simplified - all non-empty lines)
+            for line in output.lines() {
+                if !line.is_empty() {
+                    println!("{}", line);
                 }
-            };
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let result = format!(
-                "{command}\nExit status: {}\nstdout:\n{}\nstderr:\n{}",
-                output.status,
-                truncate(&stdout, 12_000),
-                truncate(&stderr, 12_000)
-            );
-            println!("Result: {}", output.status);
-            if !stdout.is_empty() {
-                print!("{stdout}");
             }
-            if !stderr.is_empty() {
-                eprint!("{stderr}");
-            }
-            Some(result)
+            Some(format!("{}\n{}", command, output))
         }
-        Err(error) => {
-            println!("Unable to start command: {error}");
-            None
+        Err(err) => {
+            println!("❌ Command failed: {}", err);
+            Some(format!("{}\nFailed: {}", command, err))
         }
     }
 }
@@ -2035,7 +2523,11 @@ fn truncate(value: &str, limit: usize) -> String {
     if value.len() <= limit {
         value.to_owned()
     } else {
-        format!("{}\n... output truncated ...", &value[..limit])
+        let mut end = limit;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n... output truncated ...", &value[..end])
     }
 }
 
