@@ -1,9 +1,34 @@
+use anyhow::{anyhow, Context, Result};
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use tempfile::NamedTempFile;
+use thiserror::Error;
+
+mod command;
+mod llm;
+mod plan;
+mod project;
+mod session;
+mod text;
+mod workflow;
+
+use command::{confirm, run_command};
+use llm::{model_config, model_request};
+use plan::{apply_plan, parse_plan, show_plan};
+use project::{
+    collect_files, design_documents, document_text, find_design, project_context, safe_path,
+};
+use session::{load_session, save_session};
+use text::truncate;
+use workflow::{
+    aggregate_results, decompose_task, execute_tasks_with_dependencies, should_decompose,
+    show_task_breakdown,
+};
 
 const MAX_FILE_BYTES: usize = 512 * 1024;
 const MAX_CONTEXT_TOKENS: usize = 200_000;
@@ -13,37 +38,6 @@ const LEGACY_SESSION_STATE: &str = ".codex/javora-session.state";
 const LEGACY_CONFIG_STATE: &str = ".codex/javora-config";
 // Whitelist of allowed commands for security
 // See docs/command-security.md for rationale and deployment options.
-#[derive(Debug)]
-enum AllowedCommand {
-    Maven {
-        program: String,
-        subcommand: String,
-        args: Vec<String>,
-    },
-    Gradle {
-        program: String,
-        task: String,
-        args: Vec<String>,
-    },
-    GitRead {
-        subcommand: String,
-        args: Vec<String>,
-    },
-    FileRead {
-        command: String,
-        args: Vec<String>,
-    },
-    JavaTool {
-        tool: String,
-        args: Vec<String>,
-    },
-}
-
-const ALLOWED_MAVEN_SUBCOMMANDS: &[&str] =
-    &["clean", "compile", "test", "package", "install", "verify"];
-const ALLOWED_GRADLE_TASKS: &[&str] = &["build", "test", "assemble", "check", "clean"];
-const ALLOWED_GIT_SUBCOMMANDS: &[&str] = &["status", "log", "diff", "branch", "show"];
-const ALLOWED_FILE_COMMANDS: &[&str] = &["ls", "cat", "find", "grep", "tree", "head", "tail"];
 
 struct FileChange {
     path: String,
@@ -89,6 +83,24 @@ struct TaskBreakdown {
     execution_strategy: ExecutionStrategy,
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+enum TaskBreakdownError {
+    #[error("model did not return a task breakdown envelope")]
+    MissingEnvelope,
+    #[error("missing {0}")]
+    MissingField(&'static str),
+    #[error("no tasks found in breakdown")]
+    NoTasks,
+    #[error("duplicate task ID: {0}")]
+    DuplicateTaskId(String),
+    #[error("task {0} depends on itself")]
+    SelfDependency(String),
+    #[error("task {task} depends on unknown task {dependency}")]
+    UnknownDependency { task: String, dependency: String },
+    #[error("task dependency cycle detected")]
+    DependencyCycle,
+}
+
 #[derive(Clone, Debug)]
 enum ExecutionStrategy {
     Sequential,
@@ -117,93 +129,6 @@ struct ModelConfig {
     provider: Provider,
     base_url: String,
     model: String,
-}
-
-fn config_value(root: &Path, key: &str) -> Option<String> {
-    fs::read_to_string(root.join(CONFIG_STATE))
-        .or_else(|_| fs::read_to_string(root.join(LEGACY_CONFIG_STATE)))
-        .ok()?
-        .lines()
-        .find_map(|line| {
-            line.split_once('=')
-                .filter(|(name, _)| *name == key)
-                .map(|(_, value)| value.to_owned())
-        })
-}
-
-fn prompt_value(label: &str) -> String {
-    print!("{label}: ");
-    let _ = io::stdout().flush();
-    let mut value = String::new();
-    let _ = io::stdin().read_line(&mut value);
-    value.trim().to_owned()
-}
-
-fn model_config(root: &Path) -> Option<ModelConfig> {
-    let configured_provider = env::var("JAVORA_PROVIDER")
-        .ok()
-        .or_else(|| config_value(root, "provider"));
-    let configured_provider = configured_provider.or_else(|| {
-        let value = prompt_value("Provider [openai/anthropic]");
-        Some(if value.is_empty() {
-            "openai".to_owned()
-        } else {
-            value
-        })
-    });
-    let provider = match configured_provider.as_deref() {
-        Some("anthropic") => Provider::Anthropic,
-        Some("openai") | Some("") | None => Provider::OpenAi,
-        Some(other) => {
-            println!("Unsupported JAVORA_PROVIDER: {other}");
-            return None;
-        }
-    };
-    let model = env::var("JAVORA_MODEL")
-        .ok()
-        .or_else(|| config_value(root, "model"))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| prompt_value("Model (required)"));
-    if model.is_empty() {
-        println!("A model is required.");
-        return None;
-    }
-    let default_base = match provider {
-        Provider::OpenAi => "https://api.openai.com/v1",
-        Provider::Anthropic => "https://api.anthropic.com/v1",
-    };
-    let base_url = env::var("JAVORA_BASE_URL")
-        .ok()
-        .or_else(|| config_value(root, "base_url"))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| prompt_value(&format!("Base URL [{default_base}]")));
-    let base_url = if base_url.is_empty() {
-        default_base.to_owned()
-    } else {
-        base_url
-    };
-    if !root.join(CONFIG_STATE).exists() {
-        let provider_name = match provider {
-            Provider::OpenAi => "openai",
-            Provider::Anthropic => "anthropic",
-        };
-        let path = root.join(CONFIG_STATE);
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if let Err(error) = fs::write(
-            path,
-            format!("provider={provider_name}\nmodel={model}\nbase_url={base_url}\n"),
-        ) {
-            eprintln!("Unable to save local model configuration: {error}");
-        }
-        println!("Saved local provider configuration. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in your environment.");
-    }
-    Some(ModelConfig {
-        provider,
-        base_url,
-        model,
-    })
 }
 
 enum Workflow {
@@ -257,649 +182,6 @@ struct Session {
     compression_count: u32,
 }
 
-impl Session {
-    fn new() -> Self {
-        Self {
-            history: Vec::new(),
-            conversation: Vec::new(),
-            last_command_result: None,
-            workflow: Workflow::Idle,
-            resume_required: false,
-            plan_version: 0,
-            user_context: Vec::new(),
-            compression_count: 0,
-        }
-    }
-
-    fn remember(&mut self, entry: String) {
-        self.history.push(entry);
-        if self.history.len() > 8 {
-            self.history.remove(0);
-        }
-    }
-
-    fn add_turn(&mut self, role: &str, content: String, turn_type: TurnType) {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        self.conversation.push(ConversationTurn {
-            role: role.to_owned(),
-            content,
-            timestamp,
-            turn_type,
-        });
-        if self.conversation.len() > 20 {
-            self.conversation.remove(0);
-        }
-    }
-
-    fn estimate_tokens(&self) -> usize {
-        let mut total = 0;
-        for turn in &self.conversation {
-            total += turn.content.len() / 4;
-        }
-        for ctx in &self.user_context {
-            total += ctx.len() / 4;
-        }
-        if let Some(result) = &self.last_command_result {
-            total += result.len() / 4;
-        }
-        total
-    }
-
-    fn should_compress(&self) -> bool {
-        self.estimate_tokens() > MAX_CONTEXT_TOKENS
-    }
-
-    fn compress_context(&mut self, root: &Path, config: &ModelConfig) {
-        if !self.should_compress() {
-            return;
-        }
-
-        println!("上下文已超过 {} tokens，正在压缩...", MAX_CONTEXT_TOKENS);
-
-        let summary = self.generate_summary(root, config);
-        if let Some(summary) = summary {
-            let compressed_turn = ConversationTurn {
-                role: "system".to_owned(),
-                content: format!(
-                    "[自动压缩 #{} - {}]\n{}",
-                    self.compression_count + 1,
-                    chrono_now_str(),
-                    summary
-                ),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                turn_type: TurnType::AssistantResponse,
-            };
-
-            let recent_turns: Vec<_> = self
-                .conversation
-                .iter()
-                .rev()
-                .take(5)
-                .rev()
-                .cloned()
-                .collect();
-
-            let recent_count = recent_turns.len();
-            self.conversation.clear();
-            self.conversation.push(compressed_turn);
-            self.conversation.extend(recent_turns);
-            self.compression_count += 1;
-
-            println!(
-                "压缩完成，从 {} 轮对话压缩为摘要 + 最近 5 轮",
-                recent_count + 1
-            );
-        }
-    }
-
-    fn generate_summary(&self, root: &Path, config: &ModelConfig) -> Option<String> {
-        let mut content = String::new();
-        content.push_str("请总结以下对话历史，提取关键信息：\n\n");
-
-        for (index, turn) in self.conversation.iter().enumerate() {
-            let label = match turn.turn_type {
-                TurnType::UserRequest => "用户",
-                TurnType::AssistantQuestion => "Javora[问题]",
-                TurnType::AssistantResponse => "Javora",
-                TurnType::CommandExecution => "命令结果",
-                TurnType::FileInspection => "文件检查",
-            };
-            let preview = truncate(&turn.content, 500);
-            content.push_str(&format!("[{}] {}: {}\n\n", index + 1, label, preview));
-        }
-
-        content.push_str("请生成一个简洁的摘要，保留：\n");
-        content.push_str("1. 用户的主要目标和需求\n");
-        content.push_str("2. 已完成的关键操作\n");
-        content.push_str("3. 重要的决策和结论\n");
-        content.push_str("4. 当前进度和待办事项\n");
-
-        let system = "你是 Javora 的会话压缩助手。生成简洁的摘要，去除冗余信息，保留关键上下文。";
-        compress_request(root, config, &content, system)
-    }
-
-    fn structured_context(&self) -> String {
-        let mut context = String::new();
-        if !self.user_context.is_empty() {
-            context.push_str("\n\nUser context:\n");
-            context.push_str(&self.user_context.join(", "));
-        }
-        if !self.conversation.is_empty() {
-            context.push_str("\n\nConversation history:\n");
-            for turn in self.conversation.iter().rev().take(10).rev() {
-                let turn_label = match turn.turn_type {
-                    TurnType::UserRequest => "User",
-                    TurnType::AssistantQuestion => "Javora [question]",
-                    TurnType::AssistantResponse => "Javora",
-                    TurnType::CommandExecution => "Command result",
-                    TurnType::FileInspection => "File inspection",
-                };
-                let preview = truncate(&turn.content, 200);
-                context.push_str(&format!("{}: {}\n", turn_label, preview));
-            }
-        }
-        if let Some(result) = &self.last_command_result {
-            let preview = truncate(result, 500);
-            context.push_str(&format!("\nLatest command result:\n{}\n", preview));
-        }
-        context
-    }
-
-    fn add_user_context(&mut self, context: String) {
-        if !self.user_context.contains(&context) {
-            self.user_context.push(context);
-            if self.user_context.len() > 5 {
-                self.user_context.remove(0);
-            }
-        }
-    }
-}
-
-fn hex_encode(value: &str) -> String {
-    value
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn hex_decode(value: &str) -> Option<String> {
-    if !value.len().is_multiple_of(2) {
-        return None;
-    }
-    let bytes = (0..value.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
-        .collect::<Option<Vec<_>>>()?;
-    String::from_utf8(bytes).ok()
-}
-
-fn save_session(root: &Path, session: &Session) -> io::Result<()> {
-    let path = root.join(SESSION_STATE);
-    match &session.workflow {
-        Workflow::Idle => {
-            if path.exists() {
-                fs::remove_file(path)?;
-            }
-        }
-        Workflow::Clarifying { transcript } => {
-            fs::create_dir_all(path.parent().expect("state parent"))?;
-            let conversation_encoded = session
-                .conversation
-                .iter()
-                .map(|turn| {
-                    let type_code = match turn.turn_type {
-                        TurnType::UserRequest => "UR",
-                        TurnType::AssistantQuestion => "AQ",
-                        TurnType::AssistantResponse => "AR",
-                        TurnType::CommandExecution => "CE",
-                        TurnType::FileInspection => "FI",
-                    };
-                    format!(
-                        "{}|{}|{}|{}",
-                        type_code,
-                        turn.timestamp,
-                        turn.role,
-                        hex_encode(&turn.content)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let user_context_encoded = hex_encode(&session.user_context.join("||"));
-            fs::write(
-                path,
-                format!(
-                    "VERSION: 3\nSTATE: CLARIFYING\nPLAN_VERSION: {}\nCOMPRESSION_COUNT: {}\nTRANSCRIPT: {}\nUSER_CONTEXT: {}\nCONVERSATION:\n{}\n",
-                    session.plan_version,
-                    session.compression_count,
-                    hex_encode(transcript),
-                    user_context_encoded,
-                    conversation_encoded
-                ),
-            )?;
-        }
-        Workflow::AwaitingApproval { requirement, plan } => {
-            fs::create_dir_all(path.parent().expect("state parent"))?;
-            let conversation_encoded = session
-                .conversation
-                .iter()
-                .map(|turn| {
-                    let type_code = match turn.turn_type {
-                        TurnType::UserRequest => "UR",
-                        TurnType::AssistantQuestion => "AQ",
-                        TurnType::AssistantResponse => "AR",
-                        TurnType::CommandExecution => "CE",
-                        TurnType::FileInspection => "FI",
-                    };
-                    format!(
-                        "{}|{}|{}|{}",
-                        type_code,
-                        turn.timestamp,
-                        turn.role,
-                        hex_encode(&turn.content)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let user_context_encoded = hex_encode(&session.user_context.join("||"));
-            fs::write(
-                path,
-                format!(
-                    "VERSION: 3\nSTATE: AWAITING_APPROVAL\nPLAN_VERSION: {}\nCOMPRESSION_COUNT: {}\nREQUIREMENT: {}\nPLAN: {}\nUSER_CONTEXT: {}\nCONVERSATION:\n{}\n",
-                    session.plan_version,
-                    session.compression_count,
-                    hex_encode(requirement),
-                    hex_encode(plan),
-                    user_context_encoded,
-                    conversation_encoded
-                ),
-            )?;
-        }
-        Workflow::AwaitingTaskApproval {
-            requirement,
-            task_breakdown,
-        } => {
-            fs::create_dir_all(path.parent().expect("state parent"))?;
-            let conversation_encoded = session
-                .conversation
-                .iter()
-                .map(|turn| {
-                    let type_code = match turn.turn_type {
-                        TurnType::UserRequest => "UR",
-                        TurnType::AssistantQuestion => "AQ",
-                        TurnType::AssistantResponse => "AR",
-                        TurnType::CommandExecution => "CE",
-                        TurnType::FileInspection => "FI",
-                    };
-                    format!(
-                        "{}|{}|{}|{}",
-                        type_code,
-                        turn.timestamp,
-                        turn.role,
-                        hex_encode(&turn.content)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let user_context_encoded = hex_encode(&session.user_context.join("||"));
-            let breakdown_encoded = serialize_task_breakdown(task_breakdown);
-            fs::write(
-                path,
-                format!(
-                    "VERSION: 4\nSTATE: AWAITING_TASK_APPROVAL\nPLAN_VERSION: {}\nCOMPRESSION_COUNT: {}\nREQUIREMENT: {}\nTASK_BREAKDOWN: {}\nUSER_CONTEXT: {}\nCONVERSATION:\n{}\n",
-                    session.plan_version,
-                    session.compression_count,
-                    hex_encode(requirement),
-                    hex_encode(&breakdown_encoded),
-                    user_context_encoded,
-                    conversation_encoded
-                ),
-            )?;
-        }
-        Workflow::AgentExecution {
-            requirement,
-            task_breakdown,
-            completed_tasks,
-        } => {
-            fs::create_dir_all(path.parent().expect("state parent"))?;
-            let conversation_encoded = session
-                .conversation
-                .iter()
-                .map(|turn| {
-                    let type_code = match turn.turn_type {
-                        TurnType::UserRequest => "UR",
-                        TurnType::AssistantQuestion => "AQ",
-                        TurnType::AssistantResponse => "AR",
-                        TurnType::CommandExecution => "CE",
-                        TurnType::FileInspection => "FI",
-                    };
-                    format!(
-                        "{}|{}|{}|{}",
-                        type_code,
-                        turn.timestamp,
-                        turn.role,
-                        hex_encode(&turn.content)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let user_context_encoded = hex_encode(&session.user_context.join("||"));
-            let breakdown_encoded = serialize_task_breakdown(task_breakdown);
-            let completed_encoded = hex_encode(&completed_tasks.join("||"));
-            fs::write(
-                path,
-                format!(
-                    "VERSION: 4\nSTATE: AGENT_EXECUTION\nPLAN_VERSION: {}\nCOMPRESSION_COUNT: {}\nREQUIREMENT: {}\nTASK_BREAKDOWN: {}\nCOMPLETED_TASKS: {}\nUSER_CONTEXT: {}\nCONVERSATION:\n{}\n",
-                    session.plan_version,
-                    session.compression_count,
-                    hex_encode(requirement),
-                    hex_encode(&breakdown_encoded),
-                    completed_encoded,
-                    user_context_encoded,
-                    conversation_encoded
-                ),
-            )?;
-        }
-        Workflow::Approved { requirement } => {
-            fs::create_dir_all(path.parent().expect("state parent"))?;
-            let conversation_encoded = session
-                .conversation
-                .iter()
-                .map(|turn| {
-                    let type_code = match turn.turn_type {
-                        TurnType::UserRequest => "UR",
-                        TurnType::AssistantQuestion => "AQ",
-                        TurnType::AssistantResponse => "AR",
-                        TurnType::CommandExecution => "CE",
-                        TurnType::FileInspection => "FI",
-                    };
-                    format!(
-                        "{}|{}|{}|{}",
-                        type_code,
-                        turn.timestamp,
-                        turn.role,
-                        hex_encode(&turn.content)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let user_context_encoded = hex_encode(&session.user_context.join("||"));
-            fs::write(
-                path,
-                format!(
-                    "VERSION: 3\nSTATE: APPROVED\nPLAN_VERSION: {}\nCOMPRESSION_COUNT: {}\nREQUIREMENT: {}\nUSER_CONTEXT: {}\nCONVERSATION:\n{}\n",
-                    session.plan_version,
-                    session.compression_count,
-                    hex_encode(requirement),
-                    user_context_encoded,
-                    conversation_encoded
-                ),
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn serialize_task_breakdown(breakdown: &TaskBreakdown) -> String {
-    let mut result = format!(
-        "SUMMARY:{}\nSTRATEGY:{:?}\nTASKS:\n",
-        breakdown.summary, breakdown.execution_strategy
-    );
-    for task in &breakdown.tasks {
-        result.push_str(&format!(
-            "ID:{}\nNAME:{}\nDESC:{}\nTYPE:{:?}\nCOMPLEXITY:{:?}\nDEPS:{}\nPROMPT:{}\n---\n",
-            task.id,
-            task.name,
-            task.description,
-            task.task_type,
-            task.estimated_complexity,
-            task.dependencies.join(","),
-            task.agent_prompt
-        ));
-    }
-    result
-}
-
-fn deserialize_task_breakdown(data: &str) -> Option<TaskBreakdown> {
-    let lines: Vec<&str> = data.lines().collect();
-    let summary = lines.iter().find_map(|l| l.strip_prefix("SUMMARY:"))?;
-    let strategy_str = lines.iter().find_map(|l| l.strip_prefix("STRATEGY:"))?;
-    let execution_strategy = match strategy_str {
-        "Sequential" => ExecutionStrategy::Sequential,
-        "Parallel" => ExecutionStrategy::Parallel,
-        _ => ExecutionStrategy::Mixed,
-    };
-
-    let mut tasks = Vec::new();
-    let task_sections: Vec<&str> = data.split("---\n").collect();
-
-    for section in task_sections.iter().skip(1) {
-        if section.trim().is_empty() {
-            continue;
-        }
-        let section_lines: Vec<&str> = section.lines().collect();
-        let id = section_lines
-            .iter()
-            .find_map(|l| l.strip_prefix("ID:"))?
-            .to_owned();
-        let name = section_lines
-            .iter()
-            .find_map(|l| l.strip_prefix("NAME:"))?
-            .to_owned();
-        let description = section_lines
-            .iter()
-            .find_map(|l| l.strip_prefix("DESC:"))?
-            .to_owned();
-        let type_str = section_lines.iter().find_map(|l| l.strip_prefix("TYPE:"))?;
-        let complexity_str = section_lines
-            .iter()
-            .find_map(|l| l.strip_prefix("COMPLEXITY:"))?;
-        let deps_str = section_lines
-            .iter()
-            .find_map(|l| l.strip_prefix("DEPS:"))?
-            .to_owned();
-        let prompt = section_lines
-            .iter()
-            .find_map(|l| l.strip_prefix("PROMPT:"))?
-            .to_owned();
-
-        let task_type = match type_str {
-            "Analysis" => TaskType::Analysis,
-            "Design" => TaskType::Design,
-            "Implementation" => TaskType::Implementation,
-            "Testing" => TaskType::Testing,
-            _ => TaskType::Integration,
-        };
-
-        let estimated_complexity = match complexity_str {
-            "Low" => ComplexityLevel::Low,
-            "Medium" => ComplexityLevel::Medium,
-            _ => ComplexityLevel::High,
-        };
-
-        let dependencies: Vec<String> = if deps_str.is_empty() {
-            Vec::new()
-        } else {
-            deps_str.split(',').map(|s| s.to_owned()).collect()
-        };
-
-        tasks.push(Task {
-            id,
-            name,
-            description,
-            dependencies,
-            task_type,
-            agent_prompt: prompt,
-            estimated_complexity,
-        });
-    }
-
-    Some(TaskBreakdown {
-        summary: summary.to_owned(),
-        tasks,
-        execution_strategy,
-    })
-}
-
-fn load_session(root: &Path) -> io::Result<Option<Session>> {
-    let path = root.join(SESSION_STATE);
-    let path = if path.exists() {
-        path
-    } else {
-        root.join(LEGACY_SESSION_STATE)
-    };
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(&path)?;
-    let lines = text.lines();
-    let mut fields = std::collections::HashMap::new();
-    let mut conversation_lines = Vec::new();
-    let mut in_conversation = false;
-
-    for line in lines {
-        if line.starts_with("CONVERSATION:") {
-            in_conversation = true;
-            continue;
-        }
-        if in_conversation {
-            if !line.is_empty() {
-                conversation_lines.push(line);
-            }
-        } else if let Some((key, value)) = line.split_once(':') {
-            fields.insert(key, value.trim());
-        }
-    }
-
-    let version = fields.get("VERSION").copied().unwrap_or("2");
-    if version != "4" && version != "3" && version != "2" {
-        return Ok(None);
-    }
-
-    let plan_version = fields
-        .get("PLAN_VERSION")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    let compression_count = fields
-        .get("COMPRESSION_COUNT")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    let decode_field = |name: &str| fields.get(name).and_then(|value| hex_decode(value));
-
-    let mut conversation = Vec::new();
-    let mut user_context = Vec::new();
-
-    if version == "3" || version == "4" {
-        if let Some(encoded) = fields.get("USER_CONTEXT").and_then(|v| hex_decode(v)) {
-            user_context = encoded
-                .split("||")
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_owned())
-                .collect();
-        }
-
-        for line in conversation_lines {
-            let parts: Vec<&str> = line.splitn(4, '|').collect();
-            if parts.len() == 4 {
-                let turn_type = match parts[0] {
-                    "UR" => TurnType::UserRequest,
-                    "AQ" => TurnType::AssistantQuestion,
-                    "AR" => TurnType::AssistantResponse,
-                    "CE" => TurnType::CommandExecution,
-                    "FI" => TurnType::FileInspection,
-                    _ => continue,
-                };
-                if let (Ok(timestamp), Some(content)) =
-                    (parts[1].parse::<u64>(), hex_decode(parts[3]))
-                {
-                    conversation.push(ConversationTurn {
-                        role: parts[2].to_owned(),
-                        content,
-                        timestamp,
-                        turn_type,
-                    });
-                }
-            }
-        }
-    }
-
-    let workflow = match fields.get("STATE").copied() {
-        Some("CLARIFYING") => match decode_field("TRANSCRIPT") {
-            Some(transcript) => Workflow::Clarifying { transcript },
-            None => return Ok(None),
-        },
-        Some("AWAITING_APPROVAL") => match (decode_field("REQUIREMENT"), decode_field("PLAN")) {
-            (Some(requirement), Some(plan)) => Workflow::AwaitingApproval { requirement, plan },
-            _ => return Ok(None),
-        },
-        Some("AWAITING_TASK_APPROVAL") => {
-            match (decode_field("REQUIREMENT"), decode_field("TASK_BREAKDOWN")) {
-                (Some(requirement), Some(breakdown_data)) => {
-                    if let Some(task_breakdown) = deserialize_task_breakdown(&breakdown_data) {
-                        Workflow::AwaitingTaskApproval {
-                            requirement,
-                            task_breakdown,
-                        }
-                    } else {
-                        return Ok(None);
-                    }
-                }
-                _ => return Ok(None),
-            }
-        }
-        Some("AGENT_EXECUTION") => {
-            match (
-                decode_field("REQUIREMENT"),
-                decode_field("TASK_BREAKDOWN"),
-                decode_field("COMPLETED_TASKS"),
-            ) {
-                (Some(requirement), Some(breakdown_data), Some(completed_data)) => {
-                    if let Some(task_breakdown) = deserialize_task_breakdown(&breakdown_data) {
-                        let completed_tasks: Vec<String> = completed_data
-                            .split("||")
-                            .filter(|s| !s.is_empty())
-                            .map(|s| s.to_owned())
-                            .collect();
-                        Workflow::AgentExecution {
-                            requirement,
-                            task_breakdown,
-                            completed_tasks,
-                        }
-                    } else {
-                        return Ok(None);
-                    }
-                }
-                _ => return Ok(None),
-            }
-        }
-        Some("APPROVED") => match decode_field("REQUIREMENT") {
-            Some(requirement) => Workflow::Approved { requirement },
-            None => return Ok(None),
-        },
-        _ => return Ok(None),
-    };
-    let session = Session {
-        history: Vec::new(),
-        conversation,
-        last_command_result: None,
-        workflow,
-        resume_required: true,
-        plan_version,
-        user_context,
-        compression_count,
-    };
-    if path == root.join(LEGACY_SESSION_STATE) {
-        let _ = save_session(root, &session);
-    }
-    Ok(Some(session))
-}
-
 fn workflow_status(workflow: &Workflow) -> &'static str {
     match workflow {
         Workflow::Idle => "空闲",
@@ -923,25 +205,27 @@ fn requirement_response(root: &Path, session: &Session, requirement: &str) -> Op
     model_request(root, session, requirement, None, system, false)
 }
 
-fn parse_requirement(response: &str, transcript: &str) -> Result<Workflow, String> {
+fn parse_requirement(response: &str, transcript: &str) -> Result<Workflow> {
     if let Some(body) = response.strip_prefix("JAVORA_CLARIFY\n") {
         let confidence = body
             .lines()
             .find_map(|line| line.strip_prefix("CONFIDENCE: "))
             .and_then(|value| value.parse::<u8>().ok())
-            .ok_or("Missing clarification confidence")?;
+            .ok_or_else(|| anyhow!("Missing clarification confidence"))?;
         let question = body
             .lines()
             .find_map(|line| line.strip_prefix("QUESTION: "))
-            .ok_or("Missing clarification question")?;
+            .ok_or_else(|| anyhow!("Missing clarification question"))?;
         if confidence >= 95 {
-            return Err("Clarification confidence must be below 95".into());
+            return Err(anyhow!("Clarification confidence must be below 95"));
         }
         if question.trim().is_empty()
             || question.matches('?').count() > 1
             || question.matches('？').count() > 1
         {
-            return Err("Clarification response must contain exactly one focused question".into());
+            return Err(anyhow!(
+                "Clarification response must contain exactly one focused question"
+            ));
         }
         return Ok(Workflow::Clarifying {
             transcript: transcript.to_owned(),
@@ -950,12 +234,12 @@ fn parse_requirement(response: &str, transcript: &str) -> Result<Workflow, Strin
     let body = response
         .strip_prefix("JAVORA_REQUIREMENT_PLAN\n")
         .and_then(|text| text.strip_suffix("\nEND_JAVORA_REQUIREMENT_PLAN"))
-        .ok_or("Model did not return a requirements response")?;
+        .ok_or_else(|| anyhow!("Model did not return a requirements response"))?;
     let confidence = body
         .lines()
         .find_map(|line| line.strip_prefix("CONFIDENCE: "))
         .and_then(|value| value.parse::<u8>().ok())
-        .ok_or("Missing plan confidence")?;
+        .ok_or_else(|| anyhow!("Missing plan confidence"))?;
     let plan = body
         .lines()
         .skip_while(|line| !line.starts_with("PLAN: "))
@@ -963,7 +247,7 @@ fn parse_requirement(response: &str, transcript: &str) -> Result<Workflow, Strin
         .collect::<Vec<_>>()
         .join("\n");
     if confidence < 95 || plan.is_empty() {
-        return Err("Plan requires 95+ confidence and a plan".into());
+        return Err(anyhow!("Plan requires 95+ confidence and a plan"));
     }
     Ok(Workflow::AwaitingApproval {
         requirement: transcript.to_owned(),
@@ -975,411 +259,6 @@ fn question_from(response: &str) -> Option<&str> {
     response
         .lines()
         .find_map(|line| line.strip_prefix("QUESTION: "))
-}
-
-fn should_decompose(requirement: &str) -> bool {
-    let indicators = [
-        "实现",
-        "开发",
-        "设计并实现",
-        "功能",
-        "模块",
-        "系统",
-        "implement",
-        "develop",
-        "feature",
-        "module",
-        "system",
-    ];
-
-    let word_count = requirement.split_whitespace().count();
-    let has_indicator = indicators
-        .iter()
-        .any(|&word| requirement.to_lowercase().contains(word));
-
-    word_count > 20 || has_indicator
-}
-
-fn decompose_task(root: &Path, session: &Session, requirement: &str) -> Option<TaskBreakdown> {
-    let system = "You are Javora's task decomposition expert. Break down the user requirement into sub-tasks.
-Return a structured task breakdown in this format:
-
-JAVORA_TASK_BREAKDOWN
-SUMMARY: overall description
-STRATEGY: Mixed
-
-TASK: task-1
-NAME: Task name
-TYPE: Analysis
-DEPENDENCIES:
-COMPLEXITY: Medium
-DESCRIPTION: Detailed description
-AGENT_PROMPT: Prompt for the agent to execute this task
-
-TASK: task-2
-NAME: Another task
-TYPE: Implementation
-DEPENDENCIES: task-1
-COMPLEXITY: High
-DESCRIPTION: Implementation details
-AGENT_PROMPT: Implement based on analysis...
-
-END_JAVORA_TASK_BREAKDOWN
-
-Valid TYPEs: Analysis, Design, Implementation, Testing, Integration
-Valid COMPLEXITY: Low, Medium, High
-Valid STRATEGY: Sequential, Parallel, Mixed
-DEPENDENCIES: comma-separated task IDs or empty";
-
-    let response = model_request(root, session, requirement, None, system, true)?;
-    parse_task_breakdown(&response).ok()
-}
-
-fn parse_task_breakdown(response: &str) -> Result<TaskBreakdown, String> {
-    let body = response
-        .strip_prefix("JAVORA_TASK_BREAKDOWN\n")
-        .and_then(|text| text.strip_suffix("\nEND_JAVORA_TASK_BREAKDOWN"))
-        .ok_or("Model did not return a task breakdown")?;
-
-    let lines: Vec<&str> = body.lines().collect();
-    let summary = lines
-        .iter()
-        .find_map(|l| l.strip_prefix("SUMMARY: "))
-        .ok_or("Missing SUMMARY")?
-        .to_owned();
-
-    let strategy_str = lines
-        .iter()
-        .find_map(|l| l.strip_prefix("STRATEGY: "))
-        .unwrap_or("Mixed");
-
-    let execution_strategy = match strategy_str {
-        "Sequential" => ExecutionStrategy::Sequential,
-        "Parallel" => ExecutionStrategy::Parallel,
-        _ => ExecutionStrategy::Mixed,
-    };
-
-    let mut tasks = Vec::new();
-    let task_blocks: Vec<&str> = body.split("\nTASK: ").collect();
-
-    for block in task_blocks.iter().skip(1) {
-        let block_lines: Vec<&str> = block.lines().collect();
-        let id = block_lines.first().ok_or("Missing task ID")?.to_string();
-
-        let name = block_lines
-            .iter()
-            .find_map(|l| l.strip_prefix("NAME: "))
-            .ok_or("Missing NAME")?
-            .to_owned();
-
-        let description = block_lines
-            .iter()
-            .find_map(|l| l.strip_prefix("DESCRIPTION: "))
-            .ok_or("Missing DESCRIPTION")?
-            .to_owned();
-
-        let type_str = block_lines
-            .iter()
-            .find_map(|l| l.strip_prefix("TYPE: "))
-            .ok_or("Missing TYPE")?;
-
-        let complexity_str = block_lines
-            .iter()
-            .find_map(|l| l.strip_prefix("COMPLEXITY: "))
-            .ok_or("Missing COMPLEXITY")?;
-
-        let deps_str = block_lines
-            .iter()
-            .find_map(|l| l.strip_prefix("DEPENDENCIES: "))
-            .unwrap_or("");
-
-        let agent_prompt = block_lines
-            .iter()
-            .find_map(|l| l.strip_prefix("AGENT_PROMPT: "))
-            .ok_or("Missing AGENT_PROMPT")?
-            .to_owned();
-
-        let task_type = match type_str {
-            "Analysis" => TaskType::Analysis,
-            "Design" => TaskType::Design,
-            "Implementation" => TaskType::Implementation,
-            "Testing" => TaskType::Testing,
-            _ => TaskType::Integration,
-        };
-
-        let estimated_complexity = match complexity_str {
-            "Low" => ComplexityLevel::Low,
-            "Medium" => ComplexityLevel::Medium,
-            _ => ComplexityLevel::High,
-        };
-
-        let dependencies: Vec<String> = if deps_str.trim().is_empty() {
-            Vec::new()
-        } else {
-            deps_str.split(',').map(|s| s.trim().to_owned()).collect()
-        };
-
-        tasks.push(Task {
-            id,
-            name,
-            description,
-            dependencies,
-            task_type,
-            agent_prompt,
-            estimated_complexity,
-        });
-    }
-
-    if tasks.is_empty() {
-        return Err("No tasks found in breakdown".into());
-    }
-
-    let known_ids: std::collections::HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
-    for task in &tasks {
-        for dep in &task.dependencies {
-            if dep == &task.id {
-                return Err(format!("Task {} depends on itself", task.id));
-            }
-            if !known_ids.contains(dep.as_str()) {
-                return Err(format!("Task {} depends on unknown task {}", task.id, dep));
-            }
-        }
-    }
-
-    Ok(TaskBreakdown {
-        summary,
-        tasks,
-        execution_strategy,
-    })
-}
-
-fn show_task_breakdown(breakdown: &TaskBreakdown) {
-    println!(
-        "\n我建议将这个任务分解为 {} 个子任务：",
-        breakdown.tasks.len()
-    );
-    println!("{}\n", breakdown.summary);
-
-    for (idx, task) in breakdown.tasks.iter().enumerate() {
-        let type_label = match task.task_type {
-            TaskType::Analysis => "分析",
-            TaskType::Design => "设计",
-            TaskType::Implementation => "实现",
-            TaskType::Testing => "测试",
-            TaskType::Integration => "集成",
-        };
-
-        println!("{}. {} [{}]", idx + 1, task.name, type_label);
-        println!("   {}", task.description);
-
-        if !task.dependencies.is_empty() {
-            let dep_names: Vec<String> = breakdown
-                .tasks
-                .iter()
-                .filter(|t| task.dependencies.contains(&t.id))
-                .map(|t| t.name.clone())
-                .collect();
-            if !dep_names.is_empty() {
-                println!("   依赖：{}", dep_names.join("、"));
-            }
-        }
-    }
-
-    let strategy_desc = match breakdown.execution_strategy {
-        ExecutionStrategy::Sequential => "按顺序逐个执行",
-        ExecutionStrategy::Parallel => "并行执行所有任务",
-        ExecutionStrategy::Mixed => "根据依赖关系自动调度执行",
-    };
-    println!("\n执行策略：{}", strategy_desc);
-    println!("\n请回复「确认」开始执行，或者说明需要调整的地方。");
-}
-
-fn task_system_prompt(task_type: &TaskType) -> &'static str {
-    match task_type {
-        TaskType::Analysis => "You are a code analysis expert for Javora. Analyze the code and provide insights. Be thorough and specific.",
-        TaskType::Design => "You are a software architect for Javora. Design a clean, maintainable solution following Java best practices.",
-        TaskType::Implementation => "You are Javora's implementation agent. Generate a JAVORA_PLAN with file changes following the exact format.",
-        TaskType::Testing => "You are a testing expert for Javora. Design comprehensive test cases covering edge cases.",
-        TaskType::Integration => "You are an integration expert for Javora. Merge and reconcile results coherently.",
-    }
-}
-
-fn build_task_context(results: &[AgentResult], current_task: &Task) -> String {
-    let mut context = String::new();
-
-    for dep_id in &current_task.dependencies {
-        if let Some(result) = results.iter().find(|r| r.task_id == *dep_id) {
-            context.push_str(&format!("\n### 依赖任务 {} 的输出：\n", dep_id));
-            let preview = truncate(&result.output, 2000);
-            context.push_str(&preview);
-            context.push('\n');
-        }
-    }
-
-    context
-}
-
-fn execute_tasks_with_dependencies(
-    root: &Path,
-    session: &mut Session,
-    breakdown: &TaskBreakdown,
-) -> Vec<AgentResult> {
-    use std::collections::HashSet;
-
-    let mut results = Vec::new();
-    let mut completed: HashSet<String> = HashSet::new();
-    let mut failed: HashSet<String> = HashSet::new();
-    let mut remaining: Vec<&Task> = breakdown.tasks.iter().collect();
-
-    while !remaining.is_empty() {
-        let blocked: Vec<&Task> = remaining
-            .iter()
-            .filter(|task| task.dependencies.iter().any(|dep| failed.contains(dep)))
-            .copied()
-            .collect();
-
-        for task in &blocked {
-            println!("\n跳过：{}（依赖的任务未成功完成）", task.name);
-            failed.insert(task.id.clone());
-            results.push(AgentResult {
-                task_id: task.id.clone(),
-                status: AgentStatus::Failed,
-                output: String::new(),
-                plan: None,
-            });
-        }
-
-        if !blocked.is_empty() {
-            remaining.retain(|task| !failed.contains(&task.id));
-            continue;
-        }
-
-        let ready: Vec<&Task> = remaining
-            .iter()
-            .filter(|task| task.dependencies.iter().all(|dep| completed.contains(dep)))
-            .copied()
-            .collect();
-
-        if ready.is_empty() {
-            println!("\n抱歉，任务之间存在循环依赖，无法继续执行。");
-            for task in &remaining {
-                failed.insert(task.id.clone());
-                results.push(AgentResult {
-                    task_id: task.id.clone(),
-                    status: AgentStatus::Failed,
-                    output: String::new(),
-                    plan: None,
-                });
-            }
-            break;
-        }
-
-        for task in ready {
-            println!("\n开始：{}", task.name);
-
-            let context = build_task_context(&results, task);
-            let prompt = if context.is_empty() {
-                task.agent_prompt.clone()
-            } else {
-                format!(
-                    "{}\n\n前置任务输出：{}",
-                    task.agent_prompt,
-                    truncate(&context, 2000)
-                )
-            };
-
-            let system = task_system_prompt(&task.task_type);
-
-            let response = model_request(root, session, &prompt, None, system, true);
-
-            let result = match response {
-                Some(output) => {
-                    let plan = if matches!(task.task_type, TaskType::Implementation) {
-                        parse_plan(&output).ok()
-                    } else {
-                        None
-                    };
-
-                    completed.insert(task.id.clone());
-
-                    AgentResult {
-                        task_id: task.id.clone(),
-                        status: AgentStatus::Completed,
-                        output,
-                        plan,
-                    }
-                }
-                None => {
-                    failed.insert(task.id.clone());
-                    AgentResult {
-                        task_id: task.id.clone(),
-                        status: AgentStatus::Failed,
-                        output: String::new(),
-                        plan: None,
-                    }
-                }
-            };
-
-            if matches!(result.status, AgentStatus::Completed) {
-                println!("✓ 完成");
-            } else {
-                println!("✗ 失败");
-            }
-
-            results.push(result);
-        }
-
-        remaining.retain(|task| !completed.contains(&task.id) && !failed.contains(&task.id));
-    }
-
-    results
-}
-
-fn aggregate_results(
-    _root: &Path,
-    _session: &mut Session,
-    requirement: &str,
-    results: &[AgentResult],
-) -> Option<ChangePlan> {
-    use std::collections::HashMap;
-
-    let mut all_changes: HashMap<String, String> = HashMap::new();
-    let mut all_tests: Vec<String> = Vec::new();
-
-    for result in results {
-        if let Some(plan) = &result.plan {
-            for change in &plan.changes {
-                all_changes.insert(change.path.clone(), change.content.clone());
-            }
-            all_tests.extend(plan.tests.clone());
-        }
-    }
-
-    if !all_changes.is_empty() {
-        let changes: Vec<FileChange> = all_changes
-            .into_iter()
-            .map(|(path, content)| FileChange { path, content })
-            .collect();
-
-        println!("\n所有任务已完成，我已经为你准备好了代码变更。");
-
-        return Some(ChangePlan {
-            summary: format!("多Agent协作完成：{}", requirement),
-            changes,
-            tests: all_tests,
-        });
-    }
-
-    println!("\n好的，所有分析和设计任务都完成了：");
-    for result in results {
-        if matches!(result.status, AgentStatus::Completed) {
-            println!("\n【{}】", result.task_id);
-            let preview = truncate(&result.output, 500);
-            println!("{}", preview);
-        }
-    }
-
-    None
 }
 
 fn begin_or_continue_requirements(root: &Path, session: &mut Session, input: &str) {
@@ -1493,507 +372,6 @@ fn execute_approved(root: &Path, session: &mut Session, request: &str) {
     }
 }
 
-fn ignored(path: &Path) -> bool {
-    path.components().any(|part| {
-        matches!(
-            part.as_os_str().to_str(),
-            Some(".git" | ".idea" | ".codex" | ".Javora" | "target" | "node_modules")
-        )
-    })
-}
-
-fn collect_files(root: &Path, output: &mut Vec<String>) -> io::Result<()> {
-    if ignored(root) {
-        return Ok(());
-    }
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
-        if ignored(&path) {
-            continue;
-        }
-        // Reject symlinks to prevent following links outside project or circular references
-        if let Ok(metadata) = path.symlink_metadata() {
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
-        }
-        if path.is_dir() {
-            collect_files(&path, output)?;
-        } else if let Ok(relative) = path.strip_prefix(root) {
-            output.push(relative.display().to_string());
-        }
-    }
-    Ok(())
-}
-
-fn project_context(root: &Path) -> String {
-    let mut files = Vec::new();
-    let _ = collect_files(root, &mut files);
-    files.sort();
-    files.truncate(200);
-    format!(
-        "Project root: {}\n{}\nFiles:\n{}",
-        root.display(),
-        java_project_context(root, &files),
-        files.join("\n")
-    )
-}
-
-fn java_project_context(root: &Path, files: &[String]) -> String {
-    let maven = root.join("pom.xml").exists();
-    let gradle = root.join("build.gradle").exists() || root.join("build.gradle.kts").exists();
-    let java_files: Vec<_> = files
-        .iter()
-        .filter(|file| file.ends_with(".java"))
-        .collect();
-    let test_count = java_files
-        .iter()
-        .filter(|file| file.contains("/src/test/") || file.contains("\\src\\test\\"))
-        .count();
-    let main_count = java_files.len().saturating_sub(test_count);
-    let modules: Vec<_> = files
-        .iter()
-        .filter_map(|file| {
-            file.strip_suffix("/pom.xml")
-                .or_else(|| file.strip_suffix("/build.gradle"))
-                .or_else(|| file.strip_suffix("/build.gradle.kts"))
-        })
-        .filter(|module| !module.is_empty())
-        .take(20)
-        .collect();
-    let mut symbols = Vec::new();
-    for file in java_files.iter().take(80) {
-        if let Some(symbol) = java_symbol(root, file) {
-            symbols.push(symbol);
-        }
-        if symbols.len() >= 40 {
-            break;
-        }
-    }
-    let build = match (maven, gradle) {
-        (true, true) => "Maven and Gradle",
-        (true, false) => "Maven",
-        (false, true) => "Gradle",
-        (false, false) => "unknown",
-    };
-    let module_text = if modules.is_empty() {
-        "single module or no build module detected".to_owned()
-    } else {
-        modules.join(", ")
-    };
-    let symbol_text = if symbols.is_empty() {
-        "none indexed".to_owned()
-    } else {
-        symbols.join("\n")
-    };
-    format!("Java project profile:\nBuild: {build}\nModules: {module_text}\nJava sources: {main_count}, tests: {test_count}\nIndexed symbols:\n{symbol_text}")
-}
-
-fn java_symbol(root: &Path, file: &str) -> Option<String> {
-    let path = root.join(file);
-    let contents = fs::read_to_string(path).ok()?;
-    let contents = truncate(&contents, 16_000);
-    let package = contents
-        .lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_prefix("package ")
-                .and_then(|name| name.strip_suffix(';'))
-        })
-        .unwrap_or("<default>");
-    let kind = ["class", "interface", "record", "enum"]
-        .iter()
-        .find_map(|kind| {
-            contents.lines().find_map(|line| {
-                line.split_whitespace()
-                    .position(|word| word == *kind)
-                    .and_then(|index| {
-                        line.split_whitespace()
-                            .nth(index + 1)
-                            .map(|name| (*kind, name.trim_matches('{').trim_matches('(')))
-                    })
-            })
-        })?;
-    let annotations: Vec<_> = [
-        "@RestController",
-        "@Controller",
-        "@Service",
-        "@Repository",
-        "@Component",
-        "@Configuration",
-        "@SpringBootApplication",
-    ]
-    .iter()
-    .filter(|annotation| contents.contains(**annotation))
-    .copied()
-    .collect();
-    let annotation_text = if annotations.is_empty() {
-        String::new()
-    } else {
-        format!(" [{}]", annotations.join(", "))
-    };
-    Some(format!(
-        "{file}: {package}.{} {}{annotation_text}",
-        kind.1, kind.0
-    ))
-}
-
-fn design_documents(root: &Path) -> Vec<String> {
-    let mut all = Vec::new();
-    let _ = collect_files(root, &mut all);
-    all.into_iter()
-        .filter(|f| {
-            let lower = f.to_lowercase();
-            let supported = [".md", ".txt", ".yaml", ".yml", ".json", ".xml"]
-                .iter()
-                .any(|x| lower.ends_with(x));
-            supported
-                && (lower.starts_with("docs/")
-                    || [
-                        "design",
-                        "spec",
-                        "architecture",
-                        "requirements",
-                        "架构",
-                        "需求",
-                        "方案",
-                        "说明",
-                    ]
-                    .iter()
-                    .any(|x| lower.contains(x)))
-        })
-        .collect()
-}
-
-fn find_design(root: &Path, request: &str) -> Vec<String> {
-    let docs = design_documents(root);
-    let lower = request.to_lowercase();
-    docs.into_iter()
-        .filter(|f| {
-            lower.contains(&f.to_lowercase())
-                || f.split('/')
-                    .next_back()
-                    .map(|n| lower.contains(&n.to_lowercase()))
-                    .unwrap_or(false)
-        })
-        .collect()
-}
-
-fn document_text(root: &Path, file: &str) -> Option<String> {
-    safe_path(root, file)
-        .and_then(|path| fs::read_to_string(path).ok())
-        .filter(|text| text.len() <= MAX_FILE_BYTES)
-}
-
-fn safe_path(root: &Path, value: &str) -> Option<PathBuf> {
-    let root = root.canonicalize().ok()?;
-    let path = root.join(value).canonicalize().ok()?;
-    if path.strip_prefix(&root).is_ok() {
-        Some(path)
-    } else {
-        None
-    }
-}
-
-fn json_escape(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            '\u{0008}' => output.push_str("\\b"),
-            '\u{000C}' => output.push_str("\\f"),
-            character if character.is_control() => {
-                output.push_str(&format!("\\u{:04x}", character as u32))
-            }
-            character => output.push(character),
-        }
-    }
-    output
-}
-
-fn json_string_at(value: &str, start: usize) -> Option<(String, usize)> {
-    let mut index = start;
-    while value.as_bytes().get(index)?.is_ascii_whitespace() {
-        index += 1;
-    }
-    if *value.as_bytes().get(index)? != b'"' {
-        return None;
-    }
-    index += 1;
-    let mut output = String::new();
-    while index < value.len() {
-        let character = value[index..].chars().next()?;
-        index += character.len_utf8();
-        match character {
-            '"' => return Some((output, index)),
-            '\\' => {
-                let escaped = value[index..].chars().next()?;
-                index += escaped.len_utf8();
-                match escaped {
-                    '"' => output.push('"'),
-                    '\\' => output.push('\\'),
-                    '/' => output.push('/'),
-                    'b' => output.push('\u{0008}'),
-                    'f' => output.push('\u{000C}'),
-                    'n' => output.push('\n'),
-                    'r' => output.push('\r'),
-                    't' => output.push('\t'),
-                    'u' => {
-                        let hex = value.get(index..index + 4)?;
-                        let code = u32::from_str_radix(hex, 16).ok()?;
-                        index += 4;
-                        output.push(char::from_u32(code)?);
-                    }
-                    _ => return None,
-                }
-            }
-            character if !character.is_control() => output.push(character),
-            _ => return None,
-        }
-    }
-    None
-}
-
-fn json_field(response: &str, field: &str) -> Option<String> {
-    let marker = format!("\"{field}\"");
-    let mut offset = 0;
-    while let Some(found) = response[offset..].find(&marker) {
-        let after_key = offset + found + marker.len();
-        let colon = response[after_key..].find(':')? + after_key;
-        if let Some((value, _)) = json_string_at(response, colon + 1) {
-            return Some(value);
-        }
-        offset = after_key;
-    }
-    None
-}
-
-fn normalize_model_content(value: String) -> String {
-    let value = value.trim();
-    if let Some(body) = value
-        .strip_prefix("```")
-        .and_then(|text| text.find('\n').map(|index| &text[index + 1..]))
-    {
-        return body.strip_suffix("```").unwrap_or(body).trim().to_owned();
-    }
-    value.to_owned()
-}
-
-fn chrono_now_str() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let datetime = now;
-    format!("{}", datetime)
-}
-
-fn compress_request(
-    _root: &Path,
-    config: &ModelConfig,
-    content: &str,
-    system: &str,
-) -> Option<String> {
-    let key_name = match config.provider {
-        Provider::OpenAi => "OPENAI_API_KEY",
-        Provider::Anthropic => "ANTHROPIC_API_KEY",
-    };
-    let key = env::var(key_name).unwrap_or_default();
-    if key.is_empty() {
-        return None;
-    }
-
-    let prompt = json_escape(content);
-    let system = json_escape(system);
-    let model = json_escape(&config.model);
-    let (url, body, _, auth_header) = match config.provider {
-        Provider::OpenAi => (
-            format!("{}/chat/completions", config.base_url.trim_end_matches('/')),
-            format!(
-                r#"{{"model":"{model}","messages":[{{"role":"system","content":"{system}"}},{{"role":"user","content":"{prompt}"}}],"max_tokens":1000}}"#
-            ),
-            "openai",
-            format!("Authorization: Bearer {key}"),
-        ),
-        Provider::Anthropic => (
-            format!("{}/messages", config.base_url.trim_end_matches('/')),
-            format!(
-                r#"{{"model":"{model}","max_tokens":1000,"system":"{system}","messages":[{{"role":"user","content":"{prompt}"}}]}}"#
-            ),
-            "anthropic",
-            format!("x-api-key: {key}"),
-        ),
-    };
-    let header_file = env::temp_dir().join(format!("javora-compress-{}", std::process::id()));
-    if fs::write(
-        &header_file,
-        format!(
-            "header = \"{}\"\nheader = \"Content-Type: application/json\"\n{}",
-            auth_header.replace('"', "\\\""),
-            if matches!(config.provider, Provider::Anthropic) {
-                "header = \"anthropic-version: 2023-06-01\"\n"
-            } else {
-                ""
-            }
-        ),
-    )
-    .is_err()
-    {
-        return None;
-    }
-    let output = Command::new("curl")
-        .args([
-            "-fsS",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "60",
-            "--config",
-            header_file.to_str()?,
-            "-X",
-            "POST",
-            &url,
-            "-d",
-            &body,
-        ])
-        .output();
-    let _ = fs::remove_file(&header_file);
-    match output {
-        Ok(output) if output.status.success() => {
-            model_content(&String::from_utf8_lossy(&output.stdout)).ok()
-        }
-        _ => None,
-    }
-}
-
-fn model_request(
-    root: &Path,
-    session: &Session,
-    input: &str,
-    document: Option<&str>,
-    system: &str,
-    include_context: bool,
-) -> Option<String> {
-    let config = model_config(root)?;
-    let key_name = match config.provider {
-        Provider::OpenAi => "OPENAI_API_KEY",
-        Provider::Anthropic => "ANTHROPIC_API_KEY",
-    };
-    let key = env::var(key_name).unwrap_or_default();
-    if key.is_empty() {
-        println!("{key_name} is not set.");
-        return None;
-    }
-    let document = document
-        .map(|d| format!("\n\nDesign document:\n{d}"))
-        .unwrap_or_default();
-    let context = if include_context {
-        project_context(root)
-    } else {
-        String::new()
-    };
-    let history = if include_context {
-        session.structured_context()
-    } else {
-        String::new()
-    };
-    let prompt = format!("{context}{document}{history}\n\nUser task: {input}");
-    let prompt = json_escape(&prompt);
-    let system = json_escape(system);
-    let model = json_escape(&config.model);
-    let (url, body, response_kind, auth_header) = match config.provider {
-        Provider::OpenAi => (
-            format!("{}/chat/completions", config.base_url.trim_end_matches('/')),
-            format!(
-                r#"{{"model":"{model}","messages":[{{"role":"system","content":"{system}"}},{{"role":"user","content":"{prompt}"}}]}}"#
-            ),
-            "openai",
-            format!("Authorization: Bearer {key}"),
-        ),
-        Provider::Anthropic => (
-            format!("{}/messages", config.base_url.trim_end_matches('/')),
-            format!(
-                r#"{{"model":"{model}","max_tokens":4096,"system":"{system}","messages":[{{"role":"user","content":"{prompt}"}}]}}"#
-            ),
-            "anthropic",
-            format!("x-api-key: {key}"),
-        ),
-    };
-    let header_file = env::temp_dir().join(format!("javora-curl-{}", std::process::id()));
-    if fs::write(
-        &header_file,
-        format!(
-            "header = \"{}\"\nheader = \"Content-Type: application/json\"\n{}",
-            auth_header.replace('"', "\\\""),
-            if response_kind == "anthropic" {
-                "header = \"anthropic-version: 2023-06-01\"\n"
-            } else {
-                ""
-            }
-        ),
-    )
-    .is_err()
-    {
-        println!("Unable to prepare model request headers.");
-        return None;
-    }
-    let output = Command::new("curl")
-        .args([
-            "-fsS",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "120",
-            "--config",
-            header_file.to_str()?,
-            "-X",
-            "POST",
-            &url,
-            "-d",
-            &body,
-        ])
-        .output();
-    let _ = fs::remove_file(&header_file);
-    match output {
-        Ok(output) if output.status.success() => {
-            match model_content(&String::from_utf8_lossy(&output.stdout)) {
-                Ok(content) => Some(content),
-                Err(error) => {
-                    println!("Model response invalid: {error}");
-                    None
-                }
-            }
-        }
-        Ok(output) => {
-            println!(
-                "Model request failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            None
-        }
-        Err(error) => {
-            println!("Unable to start curl: {error}");
-            None
-        }
-    }
-}
-
-fn model_content(response: &str) -> Result<String, String> {
-    if let Some(error) = json_field(response, "error") {
-        return Err(error);
-    }
-    json_field(response, "content")
-        .or_else(|| json_field(response, "text"))
-        .map(normalize_model_content)
-        .filter(|content| !content.is_empty())
-        .ok_or_else(|| "missing non-empty model text content".into())
-}
-
 fn test_command(root: &Path) -> Option<&'static str> {
     if root.join("mvnw").exists() {
         Some("./mvnw test")
@@ -2008,529 +386,6 @@ fn test_command(root: &Path) -> Option<&'static str> {
     }
 }
 
-fn parse_plan(response: &str) -> Result<ChangePlan, String> {
-    let body = response
-        .strip_prefix("JAVORA_PLAN\n")
-        .and_then(|text| text.strip_suffix("\nEND_JAVORA_PLAN"))
-        .ok_or("Model did not return a Javora change plan")?;
-    let mut summary = String::new();
-    let mut changes = Vec::new();
-    let mut tests = Vec::new();
-    let mut lines = body.lines().peekable();
-    while let Some(line) = lines.next() {
-        if let Some(value) = line.strip_prefix("SUMMARY: ") {
-            summary = value.to_owned();
-        } else if let Some(value) = line.strip_prefix("TEST: ") {
-            tests.push(value.to_owned());
-        } else if let Some(path) = line.strip_prefix("FILE: ") {
-            if lines.next() != Some("```") {
-                return Err(format!("Missing content block for {path}"));
-            }
-            let mut content = String::new();
-            let mut closed = false;
-            for content_line in lines.by_ref() {
-                if content_line == "```" {
-                    closed = true;
-                    break;
-                }
-                content.push_str(content_line);
-                content.push('\n');
-            }
-            if !closed {
-                return Err(format!("Missing closing content block for {path}"));
-            }
-            if content.len() > MAX_FILE_BYTES {
-                return Err(format!("Generated content for {path} is too large"));
-            }
-            changes.push(FileChange {
-                path: path.to_owned(),
-                content,
-            });
-        }
-    }
-    if summary.is_empty() || changes.is_empty() {
-        Err("Plan requires SUMMARY and at least one FILE".into())
-    } else {
-        Ok(ChangePlan {
-            summary,
-            changes,
-            tests,
-        })
-    }
-}
-
-fn write_path(root: &Path, value: &str) -> Option<PathBuf> {
-    use std::path::Component;
-
-    let path_obj = Path::new(value);
-
-    // Explicitly reject absolute paths
-    if path_obj.is_absolute() {
-        return None;
-    }
-
-    // Explicitly reject paths containing parent directory components
-    for component in path_obj.components() {
-        if matches!(component, Component::ParentDir) {
-            return None;
-        }
-    }
-
-    let root = root.canonicalize().ok()?;
-    let path = root.join(value);
-    let parent = path.parent()?;
-    let existing_parent = parent.canonicalize().ok().or_else(|| {
-        let mut candidate = parent.to_path_buf();
-        while !candidate.exists() {
-            candidate = candidate.parent()?.to_path_buf();
-        }
-        candidate.canonicalize().ok()
-    })?;
-    existing_parent.strip_prefix(&root).ok()?;
-    if path.exists() && path.symlink_metadata().ok()?.file_type().is_symlink() {
-        return None;
-    }
-    Some(path)
-}
-
-fn show_plan(root: &Path, plan: &ChangePlan) -> bool {
-    println!("\nPlan: {}", plan.summary);
-    for change in &plan.changes {
-        let old = safe_path(root, &change.path)
-            .and_then(|path| fs::read_to_string(path).ok())
-            .unwrap_or_default();
-        println!(
-            "\n--- {}\n+++ {}",
-            if old.is_empty() {
-                "/dev/null"
-            } else {
-                &change.path
-            },
-            change.path
-        );
-        for line in old.lines() {
-            println!("-{line}");
-        }
-        for line in change.content.lines() {
-            println!("+{line}");
-        }
-    }
-    if !plan.tests.is_empty() {
-        println!("\nSuggested tests:");
-        for test in &plan.tests {
-            println!("  {test}");
-        }
-    }
-    confirm("Apply the displayed file changes")
-}
-
-fn apply_plan(root: &Path, plan: &ChangePlan) -> Result<(), String> {
-    let mut targets = Vec::new();
-    for change in &plan.changes {
-        let path = write_path(root, &change.path)
-            .ok_or_else(|| format!("Unsafe output path: {}", change.path))?;
-        targets.push((path, &change.content));
-    }
-    if targets
-        .iter()
-        .any(|(_, content)| content.len() > MAX_FILE_BYTES)
-    {
-        return Err("Plan contains oversized content".into());
-    }
-    for (path, content) in targets {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        fs::write(&path, content).map_err(|error| error.to_string())?;
-        let written = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-        if written != *content {
-            return Err(format!(
-                "Post-write verification failed: {}",
-                path.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn has_shell_metacharacters(s: &str) -> bool {
-    // Detect shell injection attempts
-    s.contains('|')
-        || s.contains(';')
-        || s.contains('&')
-        || s.contains('$')
-        || s.contains('`')
-        || s.contains('>')
-        || s.contains('<')
-        || s.contains('*')
-        || s.contains('?')
-        || s.contains('[')
-        || s.contains(']')
-        || s.contains('(')
-        || s.contains(')')
-        || s.contains('{')
-        || s.contains('}')
-        || s.contains('\\')
-        || s.contains('"')
-        || s.contains('\'')
-}
-
-fn has_outside_project_path(arg: &str) -> bool {
-    use std::path::Component;
-
-    let candidate = arg.split_once('=').map_or(arg, |(_, value)| value);
-    let path = Path::new(candidate);
-    path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
-        || (candidate.len() >= 3
-            && candidate.as_bytes()[0].is_ascii_alphabetic()
-            && candidate.as_bytes()[1] == b':'
-            && matches!(candidate.as_bytes()[2], b'/' | b'\\'))
-}
-
-fn validate_plain_args(args: &[String]) -> Result<(), String> {
-    for arg in args {
-        if has_shell_metacharacters(arg) {
-            return Err(format!(
-                "Shell metacharacters not allowed in arguments: {}",
-                arg
-            ));
-        }
-        if has_outside_project_path(arg) {
-            return Err(format!(
-                "Paths outside the project are not allowed in command arguments: {}",
-                arg
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_git_args(subcommand: &str, args: &[String]) -> Result<(), String> {
-    validate_plain_args(args)?;
-
-    if subcommand == "branch" && !args.is_empty() {
-        return Err("Git branch arguments are blocked because they can modify refs".to_string());
-    }
-
-    const BLOCKED_GIT_ARGS: &[&str] = &["--output", "--ext-diff", "--textconv"];
-    if let Some(arg) = args
-        .iter()
-        .find(|arg| BLOCKED_GIT_ARGS.contains(&arg.as_str()) || arg.starts_with("--output="))
-    {
-        return Err(format!(
-            "Git argument '{}' is blocked because it can write files or execute helpers",
-            arg
-        ));
-    }
-
-    Ok(())
-}
-
-fn validate_file_args(command: &str, args: &[String]) -> Result<(), String> {
-    validate_plain_args(args)?;
-
-    if command == "find" {
-        const BLOCKED_FIND_ACTIONS: &[&str] = &[
-            "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprint0",
-            "-fprintf",
-        ];
-        if let Some(arg) = args
-            .iter()
-            .find(|arg| BLOCKED_FIND_ACTIONS.contains(&arg.as_str()))
-        {
-            return Err(format!(
-                "Find action '{}' is blocked because it can modify files or execute commands",
-                arg
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn parse_and_validate_command(command: &str) -> Result<AllowedCommand, String> {
-    let command = command.trim();
-    if command.is_empty() {
-        return Err("Empty command".to_string());
-    }
-
-    // Split on whitespace to get command parts
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    if parts.is_empty() {
-        return Err("Empty command".to_string());
-    }
-
-    let cmd = parts[0];
-    let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
-
-    // Check for shell metacharacters in the base command
-    if has_shell_metacharacters(cmd) {
-        return Err(format!(
-            "Shell metacharacters not allowed in command: {}",
-            cmd
-        ));
-    }
-
-    // Maven
-    if cmd == "mvn" || cmd == "./mvnw" {
-        if args.is_empty() {
-            return Err("Maven requires a subcommand".to_string());
-        }
-        let subcommand = &args[0];
-        if !ALLOWED_MAVEN_SUBCOMMANDS.contains(&subcommand.as_str()) {
-            return Err(format!(
-                "Maven subcommand '{}' not allowed. Allowed: {:?}",
-                subcommand, ALLOWED_MAVEN_SUBCOMMANDS
-            ));
-        }
-        validate_plain_args(&args)?;
-        return Ok(AllowedCommand::Maven {
-            program: cmd.to_string(),
-            subcommand: subcommand.clone(),
-            args: args[1..].to_vec(),
-        });
-    }
-
-    // Gradle
-    if cmd == "gradle" || cmd == "./gradlew" {
-        if args.is_empty() {
-            return Err("Gradle requires a task".to_string());
-        }
-        let task = &args[0];
-        if !ALLOWED_GRADLE_TASKS.contains(&task.as_str()) {
-            return Err(format!(
-                "Gradle task '{}' not allowed. Allowed: {:?}",
-                task, ALLOWED_GRADLE_TASKS
-            ));
-        }
-        validate_plain_args(&args)?;
-        return Ok(AllowedCommand::Gradle {
-            program: cmd.to_string(),
-            task: task.clone(),
-            args: args[1..].to_vec(),
-        });
-    }
-
-    // Git (read-only operations)
-    if cmd == "git" {
-        if args.is_empty() {
-            return Err("Git requires a subcommand".to_string());
-        }
-        let subcommand = &args[0];
-        if !ALLOWED_GIT_SUBCOMMANDS.contains(&subcommand.as_str()) {
-            return Err(format!(
-                "Git subcommand '{}' not allowed. Allowed: {:?}",
-                subcommand, ALLOWED_GIT_SUBCOMMANDS
-            ));
-        }
-        validate_git_args(subcommand, &args[1..])?;
-        return Ok(AllowedCommand::GitRead {
-            subcommand: subcommand.clone(),
-            args: args[1..].to_vec(),
-        });
-    }
-
-    // File read operations
-    if ALLOWED_FILE_COMMANDS.contains(&cmd) {
-        validate_file_args(cmd, &args)?;
-        return Ok(AllowedCommand::FileRead {
-            command: cmd.to_string(),
-            args,
-        });
-    }
-
-    // Java runtime and compiler execution is restricted to version inspection.
-    if matches!(cmd, "java" | "javac" | "jshell") {
-        validate_plain_args(&args)?;
-        if args.len() != 1 || !matches!(args[0].as_str(), "-version" | "--version") {
-            return Err(format!(
-                "{} is restricted to -version/--version; use Maven or Gradle for approved builds and tests",
-                cmd
-            ));
-        }
-        return Ok(AllowedCommand::JavaTool {
-            tool: cmd.to_string(),
-            args,
-        });
-    }
-
-    // javap inspects class files but must not pass arbitrary options to its JVM.
-    if cmd == "javap" {
-        validate_plain_args(&args)?;
-        if args.iter().any(|arg| arg.starts_with("-J")) {
-            return Err(
-                "javap -J options are blocked because they can execute JVM agents".to_string(),
-            );
-        }
-        return Ok(AllowedCommand::JavaTool {
-            tool: cmd.to_string(),
-            args,
-        });
-    }
-
-    Err(format!(
-        "Command '{}' not in whitelist. Allowed: Maven, Gradle, Git (read-only), file read commands, and restricted Java inspection. See docs/command-security.md",
-        cmd
-    ))
-}
-
-fn execute_allowed_command(allowed: &AllowedCommand, root: &Path) -> Result<String, String> {
-    let mut cmd = match allowed {
-        AllowedCommand::Maven {
-            program,
-            subcommand,
-            args,
-        } => {
-            let mut c = Command::new(program);
-            c.arg(subcommand);
-            c.args(args);
-            c
-        }
-        AllowedCommand::Gradle {
-            program,
-            task,
-            args,
-        } => {
-            let mut c = Command::new(program);
-            c.arg(task);
-            c.args(args);
-            c
-        }
-        AllowedCommand::GitRead { subcommand, args } => {
-            let mut c = Command::new("git");
-            c.arg(subcommand);
-            c.args(args);
-            c
-        }
-        AllowedCommand::FileRead { command, args } => {
-            let mut c = Command::new(command);
-            c.args(args);
-            c
-        }
-        AllowedCommand::JavaTool { tool, args } => {
-            let mut c = Command::new(tool);
-            c.args(args);
-            c
-        }
-    };
-
-    cmd.current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-
-    match cmd.spawn() {
-        Ok(child) => {
-            let pid = child.id();
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let result = child.wait_with_output();
-                let _ = tx.send(result);
-            });
-
-            let output = match rx.recv_timeout(Duration::from_secs(120)) {
-                Ok(Ok(output)) => output,
-                Ok(Err(error)) => {
-                    return Err(format!("Command failed: {}", error));
-                }
-                Err(_) => {
-                    kill_process_tree(pid);
-                    return Err("Command timed out after 120 seconds".to_string());
-                }
-            };
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Ok(format!(
-                "Exit status: {}\nstdout:\n{}\nstderr:\n{}",
-                output.status,
-                truncate(&stdout, 12_000),
-                truncate(&stderr, 12_000)
-            ))
-        }
-        Err(error) => Err(format!("Unable to start command: {}", error)),
-    }
-}
-
-#[cfg(unix)]
-fn kill_process_tree(pid: u32) {
-    // The command is its own process group leader, so a negative pid reaches descendants.
-    let _ = Command::new("kill")
-        .arg("-9")
-        .arg(format!("-{pid}"))
-        .status();
-}
-
-#[cfg(windows)]
-fn kill_process_tree(pid: u32) {
-    let _ = Command::new("taskkill")
-        .arg("/PID")
-        .arg(pid.to_string())
-        .args(["/T", "/F"])
-        .status();
-}
-
-#[cfg(not(any(unix, windows)))]
-fn kill_process_tree(_pid: u32) {
-    eprintln!("Process-tree termination is unsupported on this platform");
-}
-
-fn run_command(root: &Path, command: &str) -> Option<String> {
-    // Parse and validate command against whitelist
-    let allowed_cmd = match parse_and_validate_command(command) {
-        Ok(cmd) => cmd,
-        Err(err) => {
-            println!("❌ Command blocked: {}", err);
-            println!("💡 See docs/command-security.md for the command policy.");
-            return None;
-        }
-    };
-
-    // User confirmation
-    if !confirm(command) {
-        println!("Command skipped.");
-        return None;
-    }
-
-    // Execute using parameterized command (not shell string)
-    match execute_allowed_command(&allowed_cmd, root) {
-        Ok(output) => {
-            println!("✅ Command completed");
-            // Print output for user (simplified - all non-empty lines)
-            for line in output.lines() {
-                if !line.is_empty() {
-                    println!("{}", line);
-                }
-            }
-            Some(format!("{}\n{}", command, output))
-        }
-        Err(err) => {
-            println!("❌ Command failed: {}", err);
-            Some(format!("{}\nFailed: {}", command, err))
-        }
-    }
-}
-
-fn truncate(value: &str, limit: usize) -> String {
-    if value.len() <= limit {
-        value.to_owned()
-    } else {
-        let mut end = limit;
-        while end > 0 && !value.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}\n... output truncated ...", &value[..end])
-    }
-}
-
 fn run_suggested_tests(root: &Path, session: &mut Session, tests: &[String]) {
     for test in tests {
         if let Some(result) = run_command(root, test) {
@@ -2538,13 +393,6 @@ fn run_suggested_tests(root: &Path, session: &mut Session, tests: &[String]) {
             session.last_command_result = Some(result);
         }
     }
-}
-
-fn confirm(command: &str) -> bool {
-    print!("Execute `{command}`? [y/N] ");
-    let _ = io::stdout().flush();
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer).is_ok() && matches!(answer.trim(), "y" | "Y" | "yes")
 }
 
 fn main() {
@@ -2676,5 +524,236 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: &str, dependencies: &[&str]) -> Task {
+        Task {
+            id: id.to_owned(),
+            name: format!("Task {id}"),
+            description: format!("Description for {id}"),
+            dependencies: dependencies
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            task_type: TaskType::Analysis,
+            agent_prompt: format!("Prompt for {id}"),
+            estimated_complexity: ComplexityLevel::Low,
+        }
+    }
+
+    #[test]
+    fn command_policy_accepts_read_only_commands_and_formats_them() {
+        let cases = [
+            ("mvn test -DskipTests", "mvn test -DskipTests"),
+            ("gradle check", "gradle check"),
+            ("git status", "git status"),
+            ("cat README.md", "cat README.md"),
+            ("java --version", "java --version"),
+        ];
+
+        for (command, expected) in cases {
+            let parsed =
+                command::parse_and_validate_command(command).expect("command should be allowed");
+            assert_eq!(parsed.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn command_policy_rejects_injection_and_mutation_attempts() {
+        let blocked = [
+            "rm -rf target",
+            "cat README.md | sh",
+            "git reset --hard",
+            "git diff --output=changes.txt",
+            "find . -delete",
+            "java -cp app Main",
+            "cat /etc/passwd",
+            "mvn test && echo done",
+        ];
+
+        for command in blocked {
+            assert!(
+                command::parse_and_validate_command(command).is_err(),
+                "command should be blocked: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_breakdown_parser_accepts_valid_tasks() {
+        let response = "JAVORA_TASK_BREAKDOWN\nSUMMARY: Build a feature\nSTRATEGY: Mixed\n\nTASK: analysis\nNAME: Analyze\nTYPE: Analysis\nDEPENDENCIES:\nCOMPLEXITY: Low\nDESCRIPTION: Analyze the existing code\nAGENT_PROMPT: Inspect the relevant code\n\nTASK: implementation\nNAME: Implement\nTYPE: Implementation\nDEPENDENCIES: analysis\nCOMPLEXITY: High\nDESCRIPTION: Implement the feature\nAGENT_PROMPT: Make the required changes\nEND_JAVORA_TASK_BREAKDOWN";
+
+        let breakdown = workflow::parse_task_breakdown(response).expect("breakdown should parse");
+        assert_eq!(breakdown.tasks.len(), 2);
+        assert_eq!(breakdown.tasks[1].dependencies, vec!["analysis"]);
+    }
+
+    #[test]
+    fn task_breakdown_parser_rejects_unknown_and_cyclic_dependencies() {
+        let unknown = vec![task("implementation", &["analysis"]), task("testing", &[])];
+        assert_eq!(
+            workflow::validate_task_dependencies(&unknown),
+            Err(TaskBreakdownError::UnknownDependency {
+                task: "implementation".to_owned(),
+                dependency: "analysis".to_owned(),
+            })
+        );
+
+        let cyclic = vec![
+            task("analysis", &["testing"]),
+            task("testing", &["analysis"]),
+        ];
+        assert_eq!(
+            workflow::validate_task_dependencies(&cyclic),
+            Err(TaskBreakdownError::DependencyCycle)
+        );
+    }
+
+    #[test]
+    fn context_compression_keeps_summary_and_recent_turns() {
+        let mut session = Session::new();
+        for index in 0..8 {
+            session.add_turn("user", format!("turn-{index}"), TurnType::UserRequest);
+        }
+
+        session.apply_compression_summary("summary".to_owned());
+
+        assert_eq!(session.compression_count, 1);
+        assert_eq!(session.conversation.len(), 6);
+        assert!(session.conversation[0].content.ends_with("summary"));
+        assert_eq!(session.conversation[1].content, "turn-3");
+        assert_eq!(session.conversation[5].content, "turn-7");
+    }
+
+    #[test]
+    fn context_compression_threshold_uses_conversation_content() {
+        let mut session = Session::new();
+        session.add_turn(
+            "user",
+            "x".repeat(MAX_CONTEXT_TOKENS * 4 + 4),
+            TurnType::UserRequest,
+        );
+
+        assert!(session.should_compress());
+    }
+
+    #[test]
+    fn token_estimation_counts_chinese_characters() {
+        assert_eq!(text::estimate_tokens("abcd"), 1);
+        assert_eq!(text::estimate_tokens("中文"), 2);
+        assert_eq!(text::estimate_tokens("中文abcd"), 3);
+    }
+
+    #[test]
+    fn session_serialization_is_shared_for_conversation_and_user_context() {
+        let conversation = vec![ConversationTurn {
+            role: "user".to_owned(),
+            content: "hello|世界".to_owned(),
+            timestamp: 42,
+            turn_type: TurnType::UserRequest,
+        }];
+        let user_context = vec!["first".to_owned(), "second".to_owned()];
+
+        assert_eq!(
+            session::serialize_conversation(&conversation),
+            "UR|42|user|68656c6c6f7ce4b896e7958c"
+        );
+        assert_eq!(
+            session::hex_decode(&session::serialize_user_context(&user_context)).as_deref(),
+            Some("first||second")
+        );
+    }
+
+    #[test]
+    fn topological_sort_returns_stable_dependency_levels() {
+        let tasks = vec![
+            task("integration", &["implementation", "testing"]),
+            task("testing", &["analysis"]),
+            task("analysis", &[]),
+            task("implementation", &["analysis"]),
+        ];
+
+        assert_eq!(
+            workflow::topological_task_levels(&tasks).expect("valid task graph"),
+            vec![
+                vec!["analysis".to_owned()],
+                vec!["testing".to_owned(), "implementation".to_owned()],
+                vec!["integration".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn model_content_parses_provider_shapes_and_escaped_text() {
+        let openai = r#"{"choices":[{"message":{"content":"JAVORA\nPLAN"}}]}"#;
+        assert_eq!(
+            llm::model_content(openai).expect("OpenAI response"),
+            "JAVORA\nPLAN"
+        );
+
+        let anthropic = r#"{"content":[{"type":"text","text":"```text\nhello\n```"}]}"#;
+        assert_eq!(
+            llm::model_content(anthropic).expect("Anthropic response"),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn model_content_rejects_invalid_json_and_provider_errors() {
+        assert!(llm::model_content("not json").is_err());
+        let error = r#"{"error":{"message":"request rejected"}}"#;
+        let message = llm::model_content(error)
+            .expect_err("provider error")
+            .to_string();
+        assert!(message.contains("request rejected"));
+    }
+
+    #[test]
+    fn session_state_round_trips_serialized_context() {
+        let root = tempfile::tempdir().expect("temporary project root");
+        let mut session = Session::new();
+        session.workflow = Workflow::Clarifying {
+            transcript: "需求：保留 | 分隔符和中文".to_owned(),
+        };
+        session.add_turn("user", "请分析这个项目".to_owned(), TurnType::UserRequest);
+        session.add_user_context("已有上下文".to_owned());
+
+        save_session(root.path(), &session).expect("save session");
+        let loaded = load_session(root.path())
+            .expect("load session")
+            .expect("session should exist");
+
+        assert_eq!(loaded.user_context, vec!["已有上下文".to_owned()]);
+        assert_eq!(loaded.conversation.len(), 1);
+        assert_eq!(loaded.conversation[0].content, "请分析这个项目");
+        match loaded.workflow {
+            Workflow::Clarifying { transcript } => {
+                assert_eq!(transcript, "需求：保留 | 分隔符和中文");
+            }
+            _ => panic!("expected clarifying workflow"),
+        }
+    }
+
+    #[test]
+    fn curl_header_temp_file_is_removed_after_use() {
+        let config = ModelConfig {
+            provider: Provider::Anthropic,
+            base_url: "https://example.invalid".to_owned(),
+            model: "test-model".to_owned(),
+        };
+        let path = {
+            let file = llm::create_curl_header(&config, "x-api-key: secret").expect("header file");
+            let path = file.path().to_path_buf();
+            let contents = fs::read_to_string(&path).expect("header contents");
+            assert!(contents.contains("anthropic-version: 2023-06-01"));
+            path
+        };
+
+        assert!(!path.exists());
     }
 }
